@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,14 @@ class AuthContext:
     Registrar", "Duty MO" — and a service that has never heard of a name must
     not lock its holder out of a module the hospital pays for. `role` is for
     logs, audit records and anything a human reads.
+
+    `actor_type` says whether a human or a machine is calling. It is NOT an
+    authorization shortcut: `if actor_type == "service": allow()` is the bug it
+    would be easiest to write with it. Authorization stays
+    archetype-plus-permission, exactly as it is for a human, so a service that
+    was never granted a permission cannot exercise it. What actor_type is for
+    is audit ("who committed this?"), and the occasional endpoint that must
+    refuse a machine outright — see require_human().
     """
 
     user_id: uuid.UUID
@@ -40,6 +49,15 @@ class AuthContext:
     is_platform_admin: bool
     jti: str | None
 
+    # Defaulted so a service constructing AuthContext directly — Billing's test
+    # suite does — keeps working unchanged when this package is upgraded.
+    # "user" is the safe default: it is what every token minted before service
+    # accounts existed is, and it grants nothing extra.
+    actor_type: Literal["user", "service"] = "user"
+    # The service account's human-readable name ("blumax-dis"), for audit rows
+    # that would otherwise record only a shadow-user UUID. None for humans.
+    service_name: str | None = None
+
     def may_access_facility(self, facility_id: uuid.UUID) -> bool:
         """Whether this caller's scope covers a facility.
 
@@ -51,3 +69,16 @@ class AuthContext:
         if self.facility_ids is None:
             return True
         return facility_id in self.facility_ids
+
+    @property
+    def is_service(self) -> bool:
+        """Whether a machine is calling. For audit and human-only gates."""
+        return self.actor_type == "service"
+
+    @property
+    def actor_label(self) -> str:
+        """Stable identifier for audit rows: the service name, else the user id.
+
+        Services record who acted; a bare shadow-user UUID answers that badly.
+        """
+        return self.service_name or str(self.user_id)

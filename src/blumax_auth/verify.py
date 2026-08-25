@@ -12,9 +12,22 @@ from blumax_auth.jwks import JwksCache
 
 ALGORITHM = "RS256"
 
+# Token types that can authenticate a request, mapped to the actor they name.
+# `refresh` is deliberately absent: it exists to mint access tokens, and letting
+# one authenticate a request would turn a long-lived credential into a
+# short-lived one's equivalent.
+#
+# `service` was added when Core gained service accounts. It is verified exactly
+# like an access token — same issuer, same audience, same signature, same
+# tenant-bound `tid` — and differs only in what it records about the caller.
+ACTOR_BY_TOKEN_TYPE: dict[str, str] = {
+    "access": "user",
+    "service": "service",
+}
+
 
 class TokenVerifier:
-    """Verifies Core-issued access tokens against the published JWKS.
+    """Verifies Core-issued access and service tokens against the published JWKS.
 
     RS256 is the only accepted algorithm, listed explicitly. Reading `alg` from
     the token header and trusting it is the classic JWT confusion attack: an
@@ -60,10 +73,11 @@ class TokenVerifier:
         except JWTError as exc:
             raise InvalidToken() from exc
 
-        if claims.get("type") != "access":
-            raise InvalidToken("Token type must be 'access'")
+        token_type = claims.get("type")
+        if token_type not in ACTOR_BY_TOKEN_TYPE:
+            raise InvalidToken(f"Token type {token_type!r} cannot authenticate a request")
 
-        return _to_context(claims)
+        return _to_context(claims, actor_type=ACTOR_BY_TOKEN_TYPE[token_type])
 
 
 def _uuid(claims: dict[str, Any], name: str) -> uuid.UUID | None:
@@ -76,7 +90,7 @@ def _uuid(claims: dict[str, Any], name: str) -> uuid.UUID | None:
         raise InvalidToken(f"Token claim {name!r} is not a valid UUID") from exc
 
 
-def _to_context(claims: dict[str, Any]) -> AuthContext:
+def _to_context(claims: dict[str, Any], *, actor_type: str = "user") -> AuthContext:
     user_id = _uuid(claims, "sub")
     if user_id is None:
         raise InvalidToken("Token missing subject claim")
@@ -100,4 +114,8 @@ def _to_context(claims: dict[str, Any]) -> AuthContext:
         provider_id=_uuid(claims, "prv"),
         is_platform_admin=bool(claims.get("adm", False)),
         jti=claims.get("jti"),
+        actor_type=actor_type,  # type: ignore[arg-type]
+        # `snm` is the service account name. Absent on human tokens, and not
+        # required on service tokens — audit falls back to the subject id.
+        service_name=claims.get("snm") if actor_type == "service" else None,
     )

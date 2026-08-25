@@ -1,4 +1,8 @@
-"""FastAPI wiring — the three dependencies a service actually puts on its routes.
+"""FastAPI wiring — the dependencies a service actually puts on its routes.
+
+Both human and service callers arrive through the same dependencies: a service
+token is verified identically and authorized identically, by archetype and
+permission. HumanAuth is the exception, for endpoints a machine must not reach.
 
 Typical setup in a service's app factory:
 
@@ -143,6 +147,26 @@ def require_role(*roles: str) -> Callable[..., object]:
     return _check
 
 
+async def require_human(
+    ctx: Annotated[AuthContext, Depends(require_tenant)],
+) -> AuthContext:
+    """An authenticated HUMAN caller — refuses service accounts.
+
+    For the narrow set of endpoints where a machine must never stand in for a
+    person: clinical attestation, consent capture, anything whose audit record
+    asserts that somebody looked at it.
+
+    This is the ONLY sanctioned use of actor_type in an authorization decision,
+    and it only ever subtracts. Adding permission on the strength of
+    actor_type — `if actor_type == "service": allow()` — bypasses the
+    archetype-and-permission check that governs every human caller, and would
+    make a service account more powerful than the role it was granted.
+    """
+    if ctx.actor_type != "user":
+        raise Forbidden("This action requires a human caller")
+    return ctx
+
+
 def require_archetype(*archetypes: str) -> Callable[..., object]:
     """Restrict a route to callers holding one of these archetypes.
 
@@ -203,3 +227,4 @@ def install_error_handler(app: object, renderer: Callable[[AuthError], object] |
 
 Auth = Annotated[AuthContext, Depends(require_auth)]
 TenantAuth = Annotated[AuthContext, Depends(require_tenant)]
+HumanAuth = Annotated[AuthContext, Depends(require_human)]

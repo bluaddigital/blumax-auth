@@ -350,6 +350,10 @@ def app(signer: Signer) -> FastAPI:
     ) -> dict:
         return {"role": ctx.role, "archetype": ctx.archetype}
 
+    @application.get("/humans-only")
+    async def humans_only(ctx: blumax_auth.HumanAuth) -> dict:
+        return {"actor_type": ctx.actor_type}
+
     return application
 
 
@@ -520,3 +524,145 @@ class TestArchetype:
             headers={"Authorization": f"Bearer {signer.token(arc='VIEWER', adm=True)}"},
         )
         assert r.status_code == 200
+
+
+# ─── Service tokens ───────────────────────────────────────────────────────────
+#
+# Core gained service accounts, so a machine caller needs a token this package
+# will verify. A service token is an access token in every respect that matters
+# to verification — same issuer, audience, signature, and tenant-bound `tid` —
+# and differs only in what it records about who is calling.
+#
+# The tenant binding is the point. A machine credential that named its own
+# tenant through a header would be the one caller on the platform allowed to
+# retype its own isolation boundary; `tid` is signed, so it cannot.
+
+class TestServiceTokens:
+
+    async def test_a_service_token_verifies(self, signer, verifier):
+        ctx = await verifier.verify(signer.token(type="service", snm="blumax-dis"))
+        assert ctx.actor_type == "service"
+        assert ctx.is_service is True
+        assert ctx.service_name == "blumax-dis"
+
+    async def test_an_access_token_is_still_a_user(self, signer, verifier):
+        """The backward-compatibility guarantee: nothing about an existing
+        token changes because this package learned about service accounts."""
+        ctx = await verifier.verify(signer.token())
+        assert ctx.actor_type == "user"
+        assert ctx.is_service is False
+        assert ctx.service_name is None
+
+    async def test_a_service_token_carries_the_full_tenant_context(
+        self, signer, verifier
+    ):
+        # Core stamps these at issuance, after checking the service account's
+        # membership in the requested tenant.
+        tid, fid = uuid.uuid4(), uuid.uuid4()
+        ctx = await verifier.verify(
+            signer.token(
+                type="service", snm="blumax-dis", tid=str(tid),
+                rol="DOCUMENT_PROCESSOR", arc="CLINICIAN", fac=[str(fid)],
+            )
+        )
+        assert ctx.tenant_id == tid
+        assert ctx.archetype == "CLINICIAN"
+        assert ctx.facility_ids == frozenset({fid})
+
+    async def test_a_service_token_without_a_tenant_is_refused_by_require_tenant(
+        self, client, signer
+    ):
+        r = await client.get(
+            "/scoped",
+            headers={"Authorization": f"Bearer {signer.token(type='service', tid=None)}"},
+        )
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] == "TENANT_CONTEXT_MISSING"
+
+    async def test_a_service_token_cannot_retype_its_tenant(self, client, signer):
+        """The isolation boundary: X-Tenant-ID never selects, only disagrees."""
+        r = await client.get(
+            "/scoped",
+            headers={
+                "Authorization": f"Bearer {signer.token(type='service')}",
+                "X-Tenant-ID": str(uuid.uuid4()),
+            },
+        )
+        assert r.status_code == 403
+        assert r.json()["error"]["code"] == "TENANT_ACCESS_DENIED"
+
+    async def test_a_refresh_token_still_cannot_authenticate(self, signer, verifier):
+        """Widening the accepted set must not widen it to refresh tokens."""
+        with pytest.raises(InvalidToken):
+            await verifier.verify(signer.token(type="refresh"))
+
+    @pytest.mark.parametrize("bogus", ["upload_grant", "id", "", None, "SERVICE"])
+    async def test_unknown_token_types_are_refused(self, signer, verifier, bogus):
+        """An allowlist, not a denylist. `upload_grant` is in here deliberately:
+        it is a planned type whose authorization semantics do not exist yet, and
+        accepting it before they do would let a narrowly-scoped upload token
+        reach every route that takes Auth or TenantAuth."""
+        with pytest.raises(InvalidToken):
+            await verifier.verify(signer.token(type=bogus))
+
+    async def test_a_service_token_is_authorized_like_any_other_caller(
+        self, client, signer
+    ):
+        """actor_type is not a permission. A service holding the CLINICIAN
+        archetype passes a clinician gate; one holding VIEWER does not."""
+        ok = await client.get(
+            "/clinical-archetype",
+            headers={"Authorization": f"Bearer {signer.token(type='service', arc='CLINICIAN')}"},
+        )
+        assert ok.status_code == 200
+
+        refused = await client.get(
+            "/clinical-archetype",
+            headers={"Authorization": f"Bearer {signer.token(type='service', arc='VIEWER')}"},
+        )
+        assert refused.status_code == 403
+
+    async def test_a_human_only_route_refuses_a_service(self, client, signer):
+        r = await client.get(
+            "/humans-only",
+            headers={"Authorization": f"Bearer {signer.token(type='service', snm='blumax-dis')}"},
+        )
+        assert r.status_code == 403
+        assert r.json()["error"]["code"] == "FORBIDDEN"
+
+    async def test_a_human_only_route_admits_a_human(self, client, signer):
+        r = await client.get(
+            "/humans-only", headers={"Authorization": f"Bearer {signer.token()}"}
+        )
+        assert r.status_code == 200
+        assert r.json()["actor_type"] == "user"
+
+    async def test_a_platform_admin_service_still_cannot_pass_a_human_gate(
+        self, client, signer
+    ):
+        """require_human subtracts and never adds — unlike the archetype gates,
+        platform admin is not an escape hatch. A machine is still a machine."""
+        r = await client.get(
+            "/humans-only",
+            headers={"Authorization": f"Bearer {signer.token(type='service', adm=True)}"},
+        )
+        assert r.status_code == 403
+
+    async def test_actor_label_names_the_service_then_falls_back(
+        self, signer, verifier
+    ):
+        """Audit rows should record 'blumax-dis', not a shadow-user UUID."""
+        named = await verifier.verify(signer.token(type="service", snm="blumax-dis"))
+        assert named.actor_label == "blumax-dis"
+
+        anonymous = await verifier.verify(signer.token(type="service"))
+        assert anonymous.actor_label == str(anonymous.user_id)
+
+    async def test_a_human_token_carrying_snm_is_not_named_by_it(
+        self, signer, verifier
+    ):
+        """`snm` is meaningful only on a service token; an access token that
+        somehow carries one must not be labelled as a service."""
+        ctx = await verifier.verify(signer.token(snm="blumax-dis"))
+        assert ctx.actor_type == "user"
+        assert ctx.service_name is None
