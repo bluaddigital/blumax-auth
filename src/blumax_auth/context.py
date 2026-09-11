@@ -39,6 +39,17 @@ class AuthContext:
     provider_id: uuid.UUID | None
     is_platform_admin: bool
     jti: str | None
+    # Core mints two token shapes off the same claim set: "access" for a
+    # human session, "service" for a service-account (client-credentials)
+    # caller acting on a tenant's behalf — e.g. pharmacy's cross-service
+    # calls into IPD/OPD. Both verify identically otherwise (same iss/aud/
+    # tid/rol/arc shape), so a route that has no reason to distinguish them
+    # (most don't) needs no change. One that does — anything that should be
+    # human-only — can check this flag; nothing else in this package does
+    # today. Defaults True for any AuthContext built by hand (e.g. test
+    # fixtures written before this field existed) rather than silently
+    # becoming ambiguous.
+    is_service: bool = False
 
     def may_access_facility(self, facility_id: uuid.UUID) -> bool:
         """Whether this caller's scope covers a facility.

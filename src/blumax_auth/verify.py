@@ -60,10 +60,11 @@ class TokenVerifier:
         except JWTError as exc:
             raise InvalidToken() from exc
 
-        if claims.get("type") != "access":
-            raise InvalidToken("Token type must be 'access'")
+        token_type = claims.get("type")
+        if token_type not in ("access", "service"):
+            raise InvalidToken("Token type must be 'access' or 'service'")
 
-        return _to_context(claims)
+        return _to_context(claims, is_service=token_type == "service")
 
 
 def _uuid(claims: dict[str, Any], name: str) -> uuid.UUID | None:
@@ -76,7 +77,7 @@ def _uuid(claims: dict[str, Any], name: str) -> uuid.UUID | None:
         raise InvalidToken(f"Token claim {name!r} is not a valid UUID") from exc
 
 
-def _to_context(claims: dict[str, Any]) -> AuthContext:
+def _to_context(claims: dict[str, Any], *, is_service: bool) -> AuthContext:
     user_id = _uuid(claims, "sub")
     if user_id is None:
         raise InvalidToken("Token missing subject claim")
@@ -100,4 +101,5 @@ def _to_context(claims: dict[str, Any]) -> AuthContext:
         provider_id=_uuid(claims, "prv"),
         is_platform_admin=bool(claims.get("adm", False)),
         jti=claims.get("jti"),
+        is_service=is_service,
     )

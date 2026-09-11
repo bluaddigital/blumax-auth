@@ -138,6 +138,22 @@ class TestValidTokens:
         )
         assert ctx.user_id
 
+    async def test_access_token_is_not_flagged_as_service(self, signer, verifier):
+        ctx = await verifier.verify(signer.token(type="access"))
+        assert ctx.is_service is False
+
+    async def test_service_token_verifies_and_is_flagged(self, signer, verifier):
+        """A service-account (client-credentials) caller acting on a tenant's
+        behalf — e.g. one service calling another cross-service — carries the
+        exact same claim shape as a human session except `type`. It must
+        verify identically (same tid/rol/arc/sub handling) rather than being
+        blanket-rejected the way a genuinely wrong type ("refresh", tested in
+        TestRejection) is."""
+        ctx = await verifier.verify(signer.token(type="service"))
+        assert ctx.is_service is True
+        assert ctx.user_id
+        assert ctx.tenant_id
+
 
 # ─── Rejection ────────────────────────────────────────────────────────────────
 
@@ -443,6 +459,16 @@ class TestDependencies:
             "/scoped", headers={"Authorization": f"Bearer {attacker.token()}"}
         )
         assert r.status_code == 401
+
+    async def test_service_token_reaches_a_tenant_scoped_route(self, client, signer):
+        """The exact cross-service scenario this claim shape exists for: one
+        service authenticating to another with a service-account token, not
+        a human session. Must pass TenantAuth the same way an access token
+        does — a service-account caller still carries a real tid."""
+        r = await client.get(
+            "/scoped", headers={"Authorization": f"Bearer {signer.token(type='service')}"}
+        )
+        assert r.status_code == 200
 
 
 # ─── Archetypes ───────────────────────────────────────────────────────────────
