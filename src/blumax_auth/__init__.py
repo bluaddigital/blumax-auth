@@ -30,6 +30,13 @@ from blumax_auth.fastapi import (
     reset,
 )
 from blumax_auth.jwks import JwksCache
+from blumax_auth.permissions import (
+    PermissionCheckUnavailable,
+    aclose_permissions,
+    configure_permissions,
+    require_permission,
+    reset_permissions,
+)
 from blumax_auth.verify import TokenVerifier
 
 __all__ = [
@@ -40,16 +47,21 @@ __all__ = [
     "InvalidToken",
     "JwksCache",
     "MissingCredentials",
+    "PermissionCheckUnavailable",
     "TenantAuth",
     "TenantContextMissing",
     "TenantMismatch",
     "TokenVerifier",
+    "aclose_permissions",
     "configure",
+    "configure_permissions",
     "install_error_handler",
     "jwks_cache",
     "require_auth",
     "require_archetype",
+    "require_permission",
     "require_role",
     "require_tenant",
     "reset",
+    "reset_permissions",
 ]
