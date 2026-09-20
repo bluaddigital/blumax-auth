@@ -134,6 +134,10 @@ def app(signer: Signer, core: FakeCore, clock: FakeClock):
     async def plain(ctx: blumax_auth.TenantAuth) -> dict:
         return {"tenant_id": str(ctx.tenant_id)}
 
+    @application.post("/visits/{visit_id}/cancel")
+    async def cancel(visit_id: uuid.UUID, ctx: ConsultWarn) -> dict:
+        return {"visit_id": str(visit_id)}
+
     yield application
     blumax_auth.reset_permissions()
     blumax_auth.reset()
@@ -581,39 +585,161 @@ class TestConcurrency:
         second = asyncio.ensure_future(checker.granted(ctx, token))
         await asyncio.sleep(0.01)
         first.cancel()                                       # the client hung up
-        assert await second == frozenset({CODE})
+        assert (await second).codes == frozenset({CODE})
         assert core.calls == 1
 
 
 # ─── Warn mode ────────────────────────────────────────────────────────────────
 
+LOGGER = "blumax_auth.permissions"
+FIELDS = {
+    "decision", "mode", "permission", "route", "method", "tenant_id", "user_id",
+    "role", "archetype", "is_service", "cached",
+}
+
+
+# Attributes every LogRecord has (plus what caplog's formatter adds): anything else on a
+# record came from `extra`.
+_STANDARD_RECORD_ATTRS = set(vars(logging.makeLogRecord({}))) | {"message", "asctime"}
+
+
+def _events(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == LOGGER and r.getMessage() == "permission_check"]
+
+
 class TestWarnMode:
-    async def test_a_would_be_denial_is_logged_and_not_refused(self, client, signer, core, caplog):
+    async def test_a_would_be_denial_is_logged_with_every_field_and_not_refused(
+        self, client, signer, core, caplog,
+    ):
         tid, uid = uuid.uuid4(), uuid.uuid4()
-        h, token = _caller(signer, core, "view_patient", tid=str(tid), sub=str(uid), rol="Nurse")
-        with caplog.at_level(logging.WARNING, logger="blumax_auth.permissions"):
+        h, _ = _caller(signer, core, "view_patient", tid=str(tid), sub=str(uid), rol="Nurse")
+        with caplog.at_level(logging.INFO, logger=LOGGER):
             r = await client.get("/consult-warn", headers=h)
         assert r.status_code == 200
-        rec = next(x for x in caplog.records if x.getMessage() == "permission_would_deny")
-        assert rec.permission == CODE and rec.outcome == "missing_permission"
-        assert rec.tenant_id == str(tid) and rec.user_id == str(uid) and rec.role == "Nurse"
+        (rec,) = _events(caplog)
+        assert rec.levelno == logging.WARNING
+        assert set(vars(rec)) >= FIELDS
+        assert rec.decision == "would_deny" and rec.reason == "missing_permission"
+        assert rec.mode == "warn" and rec.permission == CODE
+        assert rec.tenant_id == str(tid) and rec.user_id == str(uid)
+        assert rec.role == "Nurse" and rec.archetype == "CLINICIAN" and rec.is_service is False
         assert rec.method == "GET" and rec.route == "/consult-warn"
-        assert token not in caplog.text
+        assert rec.cached is False and isinstance(rec.core_latency_ms, float)
 
-    async def test_an_allowed_caller_logs_nothing(self, client, signer, core, caplog):
+    async def test_an_allowed_caller_is_logged_at_info(self, client, signer, core, caplog):
         h, _ = _caller(signer, core, CODE)
-        with caplog.at_level(logging.DEBUG, logger="blumax_auth.permissions"):
+        with caplog.at_level(logging.INFO, logger=LOGGER):
             assert (await client.get("/consult-warn", headers=h)).status_code == 200
-        assert not [x for x in caplog.records if x.getMessage() == "permission_would_deny"]
+        (rec,) = _events(caplog)
+        assert rec.levelno == logging.INFO
+        assert rec.decision == "allow" and not hasattr(rec, "reason")
 
-    async def test_an_unavailable_core_is_logged_and_not_refused(self, client, signer, core, caplog):
+    async def test_cached_and_latency_describe_how_the_answer_was_obtained(
+        self, client, signer, core, caplog,
+    ):
         h, _ = _caller(signer, core, CODE)
-        core.fail = httpx.ConnectError("down")
-        with caplog.at_level(logging.WARNING, logger="blumax_auth.permissions"):
-            r = await client.get("/consult-warn", headers=h)
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            await client.get("/consult-warn", headers=h)
+            await client.get("/consult-warn", headers=h)
+        first, second = _events(caplog)
+        assert first.cached is False and first.core_latency_ms >= 0
+        assert second.cached is True and not hasattr(second, "core_latency_ms")
+        assert core.calls == 1
+
+    async def test_a_failure_to_check_is_logged_with_a_reason_and_not_refused(
+        self, client, signer, core, caplog,
+    ):
+        cases = [
+            (dict(fail=httpx.ConnectError("down")), "core_unavailable", None),
+            (dict(status=500), "core_unavailable", 500),
+            (dict(status=401), "core_rejected_token", 401),
+            (dict(status=403), "core_forbidden", 403),
+            (dict(status=200, body={"permissions": "nope"}), "core_unavailable", 200),
+        ]
+        for spec, reason, status in cases:
+            core.fail = spec.get("fail")
+            token = signer.token()
+            if "status" in spec:
+                core.respond(token, spec["status"], spec.get("body"))
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger=LOGGER):
+                r = await client.get("/consult-warn", headers={"Authorization": f"Bearer {token}"})
+            assert r.status_code == 200, spec
+            (rec,) = _events(caplog)
+            assert rec.decision == "check_failed" and rec.reason == reason, spec
+            assert getattr(rec, "core_status", None) == status, spec
+            assert rec.levelno == logging.WARNING
+            core.fail = None
+
+    async def test_a_platform_admin_is_logged_as_allowed_without_asking_core(
+        self, client, signer, core, caplog,
+    ):
+        token = signer.token(adm=True)
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            r = await client.get("/consult-warn", headers={"Authorization": f"Bearer {token}"})
         assert r.status_code == 200
-        rec = next(x for x in caplog.records if x.getMessage() == "permission_would_deny")
-        assert rec.outcome == "PermissionCheckUnavailable"
+        (rec,) = _events(caplog)
+        assert rec.decision == "allow" and rec.reason == "platform_admin"
+        assert core.calls == 0
+
+    async def test_the_log_never_carries_a_token_or_a_permission_list(
+        self, client, signer, core, caplog,
+    ):
+        h, token = _caller(signer, core, "view_patient", "billing.invoice.view", "secret.marker.code")
+        with caplog.at_level(logging.DEBUG, logger=LOGGER):
+            await client.get("/consult-warn", headers=h)               # would_deny
+            await client.get("/consult-warn", headers=h)               # cached would_deny
+        records = [r for r in caplog.records if r.name == LOGGER]
+        assert records
+        for rec in records:
+            dumped = repr(vars(rec)) + rec.getMessage()
+            assert token not in dumped and token.split(".")[1] not in dumped
+            # none of the codes Core returned appear — only the one this route needs
+            assert "secret.marker.code" not in dumped and "billing.invoice.view" not in dumped
+            # An allow-list, not a deny-list: the only extra fields an event may carry are
+            # the documented ones, and every one is a plain scalar.
+            extras = {k: v for k, v in vars(rec).items() if k not in _STANDARD_RECORD_ATTRS}
+            assert set(extras) <= FIELDS | {"reason", "core_latency_ms", "core_status"}, set(extras)
+            assert all(v is None or isinstance(v, (str, int, float, bool)) for v in extras.values())
+
+    async def test_the_route_is_the_template_never_the_concrete_path(
+        self, client, signer, core, caplog,
+    ):
+        h, _ = _caller(signer, core, "view_patient")
+        visit = uuid.uuid4()
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            r = await client.post(f"/visits/{visit}/cancel", headers=h)
+        assert r.status_code == 200
+        (rec,) = _events(caplog)
+        assert rec.route == "/visits/{visit_id}/cancel" and rec.method == "POST"
+        assert str(visit) not in repr(vars(rec))
+
+    def test_with_no_matched_route_the_concrete_path_is_not_substituted(self, caplog):
+        from starlette.requests import Request
+
+        import blumax_auth.permissions as permissions
+
+        request = Request({"type": "http", "method": "GET", "path": "/patients/123-456", "headers": []})
+        ctx = AuthContext(
+            user_id=uuid.uuid4(), tenant_id=uuid.uuid4(), tenant_slug="t", role="R",
+            archetype="CLINICIAN", facility_ids=None, person_id=None, provider_id=None,
+            is_platform_admin=False, jti="j",
+        )
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            permissions._emit(request, ctx, CODE, decision="allow", cached=False)
+        (rec,) = _events(caplog)
+        assert rec.route == "<unmatched>"
+        assert "123-456" not in repr(vars(rec))
+
+    async def test_enforce_mode_logs_nothing_even_when_it_allows_and_denies(
+        self, client, signer, core, caplog,
+    ):
+        yes, _ = _caller(signer, core, CODE)
+        no, _ = _caller(signer, core, "view_patient")
+        with caplog.at_level(logging.DEBUG, logger=LOGGER):
+            assert (await client.get("/consult", headers=yes)).status_code == 200
+            assert (await client.get("/consult", headers=no)).status_code == 403
+        assert not _events(caplog)
 
     async def test_authentication_is_never_relaxed_by_the_mode(self, client, core):
         assert (await client.get("/consult-warn")).status_code == 401
@@ -629,10 +755,11 @@ class TestWarnMode:
     ):
         blumax_auth.reset_permissions()
         token = signer.token()
-        with caplog.at_level(logging.WARNING, logger="blumax_auth.permissions"):
+        with caplog.at_level(logging.INFO, logger=LOGGER):
             r = await client.get("/consult-warn", headers={"Authorization": f"Bearer {token}"})
         assert r.status_code == 200
-        assert any(getattr(x, "outcome", "") == "not_configured" for x in caplog.records)
+        (rec,) = _events(caplog)
+        assert rec.decision == "check_failed" and rec.reason == "not_configured"
 
 
 # ─── Configuration and misuse ─────────────────────────────────────────────────
