@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "blumax-auth"
-version = "0.2.1"
+version = "0.3.0"
 description = "Verify BluMax Core-issued JWTs. Verification only — never issuance."
 requires-python = ">=3.12"
 dependencies = [
@@ -13,11 +13,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# redis is only imported inside configure_session_revocation() — a service
+# that never opts into that check need not install it. Services that do
+# (via `pip install blumax-auth[session-revocation]`) get the same
+# redis.asyncio client blumax-backend itself uses.
+session-revocation = [
+    "redis>=5.0",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "cryptography>=42",
     "fastapi>=0.115",
+    "redis>=5.0",
     "ruff>=0.6",
 ]
 

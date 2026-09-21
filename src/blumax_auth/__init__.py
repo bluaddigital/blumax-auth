@@ -23,8 +23,8 @@ from blumax_auth.fastapi import (
     configure,
     install_error_handler,
     jwks_cache,
-    require_auth,
     require_archetype,
+    require_auth,
     require_role,
     require_tenant,
     reset,
@@ -36,6 +36,12 @@ from blumax_auth.permissions import (
     configure_permissions,
     require_permission,
     reset_permissions,
+)
+from blumax_auth.session_revocation import (
+    aclose_session_revocation,
+    check_session_revocation,
+    configure_session_revocation,
+    reset_session_revocation,
 )
 from blumax_auth.verify import TokenVerifier
 
@@ -53,8 +59,11 @@ __all__ = [
     "TenantMismatch",
     "TokenVerifier",
     "aclose_permissions",
+    "aclose_session_revocation",
+    "check_session_revocation",
     "configure",
     "configure_permissions",
+    "configure_session_revocation",
     "install_error_handler",
     "jwks_cache",
     "require_auth",
@@ -64,4 +73,5 @@ __all__ = [
     "require_tenant",
     "reset",
     "reset_permissions",
+    "reset_session_revocation",
 ]

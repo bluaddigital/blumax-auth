@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,16 @@ class AuthContext:
     # fixtures written before this field existed) rather than silently
     # becoming ambiguous.
     is_service: bool = False
+    # The token's own "iat" (issue time), decoded from the JWT's NumericDate
+    # (RFC 7519 §2 — whole seconds since the epoch, sub-second precision
+    # truncated away) as an aware UTC datetime. None only for a token that
+    # somehow carries no iat at all (never true for anything Core mints).
+    # Exists so an opt-in caller (see session_revocation.py) can compare a
+    # token's own age against a per-user revocation marker without a second
+    # trip through the raw claims — mirrors blumax-backend's own
+    # AccessTokenClaims.issued_at (app/core/security.py) exactly, so both
+    # sides decode "iat" the identical way.
+    issued_at: datetime | None = None
 
     def may_access_facility(self, facility_id: uuid.UUID) -> bool:
         """Whether this caller's scope covers a facility.

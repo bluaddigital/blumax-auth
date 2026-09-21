@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from jose import JWTError, jwt
@@ -67,6 +68,22 @@ class TokenVerifier:
         return _to_context(claims, is_service=token_type == "service")
 
 
+def _issued_at(claims: dict[str, Any]) -> datetime | None:
+    """The token's "iat" claim as an aware UTC datetime.
+
+    jose decodes a NumericDate claim back to a plain int (seconds since the
+    epoch), never a datetime — RFC 7519 §2, the same reason `exp` is an int
+    on this claims dict too. None only if a token somehow carries no iat at
+    all (never true for anything Core mints). Mirrors
+    blumax-backend's app/core/security.py::_issued_at exactly, so both sides
+    of a session-revocation comparison agree on what "iat" means.
+    """
+    raw = claims.get("iat")
+    if raw is None:
+        return None
+    return datetime.fromtimestamp(raw, tz=UTC)
+
+
 def _uuid(claims: dict[str, Any], name: str) -> uuid.UUID | None:
     raw = claims.get(name)
     if raw in (None, ""):
@@ -102,4 +119,5 @@ def _to_context(claims: dict[str, Any], *, is_service: bool) -> AuthContext:
         is_platform_admin=bool(claims.get("adm", False)),
         jti=claims.get("jti"),
         is_service=is_service,
+        issued_at=_issued_at(claims),
     )
