@@ -19,12 +19,14 @@ from blumax_auth.errors import (
 )
 from blumax_auth.fastapi import (
     Auth,
+    PlatformAdminAuth,
     TenantAuth,
     configure,
     install_error_handler,
     jwks_cache,
     require_archetype,
     require_auth,
+    require_platform_admin,
     require_role,
     require_tenant,
     reset,
@@ -47,6 +49,7 @@ from blumax_auth.verify import TokenVerifier
 
 __all__ = [
     "Auth",
+    "PlatformAdminAuth",
     "AuthContext",
     "AuthError",
     "Forbidden",
@@ -69,6 +72,7 @@ __all__ = [
     "require_auth",
     "require_archetype",
     "require_permission",
+    "require_platform_admin",
     "require_role",
     "require_tenant",
     "reset",

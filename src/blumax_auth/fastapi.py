@@ -143,6 +143,27 @@ def require_role(*roles: str) -> Callable[..., object]:
     return _check
 
 
+async def require_platform_admin(
+    ctx: Annotated[AuthContext, Depends(require_auth)],
+) -> AuthContext:
+    """Restrict a route to platform admins — no tenant binding required.
+
+    require_role()/require_archetype() both depend on require_tenant, which
+    is correct for a route that acts on ONE tenant's own data: even a platform
+    admin calling it needs a tenant in scope to say which tenant. It is wrong
+    for a route that manages a platform-wide resource instead — e.g. OPD's
+    specialty_master, the single global department/specialty list every
+    organization reads (see blumax-superadmin's Departments screen). A
+    superadmin's own token often carries no tenant at all (`tid` is null —
+    Core's login does not bind a platform admin to one hospital), so
+    require_tenant would refuse them with TenantContextMissing before this
+    check ever ran. Use this dependency instead for that shape of route.
+    """
+    if not ctx.is_platform_admin:
+        raise Forbidden("Platform administrator access required")
+    return ctx
+
+
 def require_archetype(*archetypes: str) -> Callable[..., object]:
     """Restrict a route to callers holding one of these archetypes.
 
@@ -203,3 +224,4 @@ def install_error_handler(app: object, renderer: Callable[[AuthError], object] |
 
 Auth = Annotated[AuthContext, Depends(require_auth)]
 TenantAuth = Annotated[AuthContext, Depends(require_tenant)]
+PlatformAdminAuth = Annotated[AuthContext, Depends(require_platform_admin)]
