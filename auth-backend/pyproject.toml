@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "blumax-auth-backend"
+version = "0.1.0"
+description = "Standalone BLUMAX identity/authentication service (Phase 1: issuance, dark/not yet consumed by any production app)."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "python-jose[cryptography]>=3.3.0",
+    "passlib[bcrypt]>=1.7.4",
+    # passlib 1.7.4's bcrypt backend detection reads bcrypt's own
+    # `__about__.__version__`, removed in bcrypt>=4.1 -- pin below that
+    # until passlib ships a fix, or this will fail at import time.
+    "bcrypt<4.1",
+    "redis>=5.0",
+    "structlog>=24.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27",
+    "ruff>=0.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# pytest-asyncio>=1.0 removed event_loop-fixture overriding in favor of
+# this ini option -- one event loop for the whole session, so the
+# module-level SQLAlchemy engine and per-test Redis clients stay valid
+# across every test instead of breaking on the second one.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

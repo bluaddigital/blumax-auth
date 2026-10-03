@@ -1,0 +1,79 @@
+# Local development ONLY -- completely self-contained (its own Postgres,
+# its own Redis, its own network, its own named volumes), with NO link to
+# Core's production authentication, database, or Redis in any way. Not
+# wired into dev-infra or blumax-platform -- this is Phase 1: build and
+# test in parallel, not deploy.
+#
+#   docker compose up -d --build
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-blumax_auth}
+      POSTGRES_USER: ${POSTGRES_USER:-authuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-authpass}
+    volumes:
+      - auth_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-authuser} -d ${POSTGRES_DB:-blumax_auth}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - blumax-auth-net
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - auth_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - blumax-auth-net
+    restart: unless-stopped
+
+  app:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-authuser}:${POSTGRES_PASSWORD:-authpass}@postgres:5432/${POSTGRES_DB:-blumax_auth}
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      # CRITICAL (Phase 3C): without this, the dev-generated signing key
+      # (app/core/keys.py::_load_or_create_dev_key, JWT_DEV_KEY_PATH)
+      # lives only in the container's writable layer -- surviving a
+      # plain `docker restart`, but NOT `docker compose down && up` or
+      # any container recreation, which would silently generate a brand
+      # new key/kid and invalidate every previously-issued token with no
+      # warning. A named volume makes the dev key an authoritative,
+      # persistent artifact, same as the database. Irrelevant in
+      # production, which requires the real JWT_PRIVATE_KEY env var and
+      # refuses to start without it (keys.py's own guard) -- this volume
+      # only matters for the dev-key fallback path.
+      - auth_devkeys:/app/.dev-keys
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8040:8040"
+    networks:
+      - blumax-auth-net
+    restart: unless-stopped
+
+networks:
+  blumax-auth-net:
+    driver: bridge
+
+volumes:
+  auth_pgdata:
+  auth_redisdata:
+  auth_devkeys:
