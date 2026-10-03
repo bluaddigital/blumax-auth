@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import structlog
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.identity_routes import identity_router
 from app.api.password_routes import password_router
 from app.api.routes import health_router, jwks_router, router
 from app.api.service_routes import service_router
 from app.api.sso_routes import sso_router
+from app.core.config import settings
 
 structlog.configure(
     processors=[
@@ -35,6 +37,19 @@ def create_app() -> FastAPI:
         "consumers should keep using the blumax_auth package; this service "
         "is the issuer.",
     )
+    # Phase 4I-1: Superadmin's console is this service's first browser-direct
+    # consumer (see ALLOWED_ORIGINS's own docstring in app/core/config.py).
+    # Bearer-token-only API, no cookie ever crosses this boundary, so
+    # allow_credentials stays False even once origins are configured.
+    if settings.ALLOWED_ORIGINS:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.ALLOWED_ORIGINS,
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
     app.include_router(router)
     app.include_router(jwks_router)
     app.include_router(health_router)

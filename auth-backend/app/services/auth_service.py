@@ -162,3 +162,14 @@ async def verify_access_token(redis: Redis, token: str) -> dict:
     if revoked:
         raise InvalidToken("session revoked")
     return claims
+
+
+async def get_identifier(db: AsyncSession, *, user_id: str) -> str | None:
+    """The identifier this user originally logged in with -- added for
+    GET /auth/me (Phase 4I-1), purely for a caller to display something
+    human-readable. Never used for verification or authorization, which
+    read only the token's own `sub`. None only if `sub` resolves to no
+    User row at all, which a verified token already makes effectively
+    impossible (there is nothing else `sub` could have come from)."""
+    user = await db.get(User, uuid.UUID(user_id))
+    return user.identifier if user is not None else None

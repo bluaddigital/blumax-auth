@@ -63,6 +63,7 @@ async def logout_route(
 async def me_route(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
     redis: Redis = Depends(get_redis),
+    db: AsyncSession = Depends(get_db),
 ) -> MeResponse:
     if credentials is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing bearer token")
@@ -70,7 +71,10 @@ async def me_route(
         claims = await auth_service.verify_access_token(redis, credentials.credentials)
     except InvalidToken as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
-    return MeResponse(sub=claims["sub"], iss=claims["iss"], aud=claims["aud"], type=claims["type"])
+    identifier = await auth_service.get_identifier(db, user_id=claims["sub"])
+    return MeResponse(
+        sub=claims["sub"], iss=claims["iss"], aud=claims["aud"], type=claims["type"], identifier=identifier,
+    )
 
 
 @jwks_router.get("/.well-known/jwks.json")

@@ -16,6 +16,9 @@ reinvented.
 """
 from __future__ import annotations
 
+import json
+
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,6 +28,27 @@ class Settings(BaseSettings):
     APP_NAME: str = "blumax-auth-backend"
     ENVIRONMENT: str = "development"
     DEBUG: bool = False
+
+    # Phase 4I-1 (Superadmin frontend integration): this service's first
+    # browser-direct consumer. Every prior consumer (Labs, Pharmacy) only
+    # ever called /auth/* server-to-server from its own backend, which
+    # needs no CORS at all -- a browser calling this service's /auth/login
+    # directly, the way Superadmin's console now does, is new. Mirrors
+    # blumax-backend's own ALLOWED_ORIGINS field name/shape exactly (same
+    # JSON-array-or-comma-list env parsing below) so a deployment already
+    # configuring Core's CORS knows this one works the same way. Empty by
+    # default: an operator must opt a browser origin in explicitly.
+    ALLOWED_ORIGINS: list[str] = []
+
+    @field_validator("ALLOWED_ORIGINS", mode="before")
+    @classmethod
+    def _parse_origins(cls, v: object) -> object:
+        if isinstance(v, str):
+            v = v.strip()
+            if v.startswith("["):
+                return json.loads(v)
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return v
 
     DATABASE_URL: str
     REDIS_URL: str

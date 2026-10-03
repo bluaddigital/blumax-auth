@@ -15,6 +15,19 @@ async def test_login_then_me_succeeds(client: AsyncClient, test_user: User):
     assert r.json()["sub"] == str(test_user.id)
 
 
+async def test_me_includes_the_login_identifier(client: AsyncClient, test_user: User):
+    """Phase 4I-1 (Superadmin frontend integration): added purely for a
+    caller to display something human-readable -- never used by this
+    service's own verification, which still reads only `sub`."""
+    login = await client.post(
+        "/auth/login", json={"identifier": "alice@example.test", "password": "correct-horse-battery-staple"}
+    )
+    access = login.json()["access_token"]
+    r = await client.get("/auth/me", headers={"Authorization": f"Bearer {access}"})
+    assert r.status_code == 200
+    assert r.json()["identifier"] == "alice@example.test"
+
+
 async def test_logout_revokes_refresh_token(client: AsyncClient, test_user: User):
     login = await client.post(
         "/auth/login", json={"identifier": "alice@example.test", "password": "correct-horse-battery-staple"}
