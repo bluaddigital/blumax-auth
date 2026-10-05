@@ -23,8 +23,23 @@ corrected here. Reusing Core's exact wire format is deliberate: it lets
 the SAME shared-library mechanism work against either issuer's Redis
 without a consumer needing to know or care which one is currently
 authoritative.
+
+VALUE FORMAT (fixed, Phase 4I-5B): the marker VALUE was a raw
+`str(time.time())` epoch float -- the KEY matched the shared library's
+expectation but the VALUE did not (the library's own read side does
+`datetime.fromisoformat(raw)`, which raises on a bare float string and
+is caught as "marker_malformed", silently failing OPEN). Found live, not
+assumed: a Superadmin-side consumer wiring in
+blumax_auth.session_revocation.check_session_revocation() saw every
+revoked session reported as still valid. Switched to
+`datetime.now(UTC).isoformat()`, matching what Core writes and what the
+shared library actually parses, so this module's own claim above (an
+external consumer doesn't need to know or care which issuer is
+authoritative) is now actually true rather than only true for the key.
 """
 from __future__ import annotations
+
+from datetime import UTC, datetime
 
 import structlog
 from redis.asyncio import Redis
@@ -41,9 +56,8 @@ def _key(user_id: str) -> str:
 
 
 async def revoke_user_sessions(redis: Redis, user_id: str) -> None:
-    import time
     await redis.set(
-        _key(user_id), str(time.time()), ex=settings.SESSION_REVOCATION_TTL_SECONDS,
+        _key(user_id), datetime.now(UTC).isoformat(), ex=settings.SESSION_REVOCATION_TTL_SECONDS,
     )
     logger.info("session_revocation.revoked", user_id=user_id)
 
@@ -63,5 +77,19 @@ async def is_session_revoked(redis: Redis, *, user_id: str, issued_at: float) ->
 
     if marker is None:
         return False
-    revoked_at = float(marker)
-    return revoked_at >= issued_at
+    try:
+        revoked_at = datetime.fromisoformat(marker)
+    except ValueError:
+        # A marker in the old (pre-Phase-4I-5B) raw-epoch-float format, or
+        # otherwise malformed. Same posture as an unreachable Redis: log
+        # loudly, never silently ignore, and respect the configured fail
+        # mode rather than letting an unhandled exception surface as a 500.
+        fail_closed = settings.SESSION_REVOCATION_FAIL_MODE == "closed"
+        logger.error(
+            "session_revocation.marker_malformed",
+            user_id=user_id, fail_mode=settings.SESSION_REVOCATION_FAIL_MODE,
+            treating_as_revoked=fail_closed,
+        )
+        return fail_closed
+    issued_at_dt = datetime.fromtimestamp(issued_at, tz=UTC)
+    return revoked_at >= issued_at_dt

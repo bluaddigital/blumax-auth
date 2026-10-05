@@ -63,3 +63,30 @@ async def test_logout_revokes_still_unexpired_access_token(client: AsyncClient, 
 async def test_missing_bearer_rejected(client: AsyncClient):
     r = await client.get("/auth/me")
     assert r.status_code == 401
+
+
+async def test_revocation_marker_is_written_as_an_iso_timestamp_on_the_wire(
+    client: AsyncClient, test_user: User, _fresh_redis_per_test
+):
+    """Phase 4I-5B regression guard: the marker's KEY format
+    (session_revoked_at:{user_id}) already matched the shared
+    blumax_auth.session_revocation library's expectation, but the VALUE
+    was a raw str(time.time()) epoch float -- the library's own read side
+    does datetime.fromisoformat(raw), which raised on that shape and was
+    silently caught as "marker_malformed", failing OPEN for every
+    external consumer (found live, wiring this up for Superadmin). This
+    pins the wire format directly so a future change can't silently
+    regress it without this repo's own test suite catching it, even
+    though no external consumer's code lives here to exercise."""
+    login = await client.post(
+        "/auth/login", json={"identifier": "alice@example.test", "password": "correct-horse-battery-staple"}
+    )
+    refresh = login.json()["refresh_token"]
+
+    await client.post("/auth/logout", json={"refresh_token": refresh})
+
+    marker = await _fresh_redis_per_test.get(f"session_revoked_at:{test_user.id}")
+    assert marker is not None
+    from datetime import datetime  # noqa: PLC0415
+
+    datetime.fromisoformat(marker)  # raises ValueError if this regresses
