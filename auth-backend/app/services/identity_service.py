@@ -44,11 +44,16 @@ def _generate_temp_password() -> str:
 
 
 async def create_identity(
-    db: AsyncSession, *, identifier: str, password: str | None, created_user_id: uuid.UUID | None = None,
+    db: AsyncSession, *, identifier: str, password: str | None,
+    username: str | None = None, created_user_id: uuid.UUID | None = None,
 ) -> tuple[User, str | None]:
     existing = await db.execute(select(User).where(User.identifier == identifier))
     if existing.scalar_one_or_none() is not None:
         raise DuplicateIdentifierError(f"identifier already exists: {identifier!r}")
+    if username is not None:
+        existing_username = await db.execute(select(User).where(User.username == username))
+        if existing_username.scalar_one_or_none() is not None:
+            raise DuplicateIdentifierError(f"username already exists: {username!r}")
 
     temp_password = None
     if password is None:
@@ -58,7 +63,8 @@ async def create_identity(
         raw_password = password
 
     user = User(
-        id=uuid.uuid4(), identifier=identifier, hashed_password=hash_password(raw_password), is_active=True,
+        id=uuid.uuid4(), identifier=identifier, username=username,
+        hashed_password=hash_password(raw_password), is_active=True,
     )
     db.add(user)
     await db.commit()
@@ -67,7 +73,10 @@ async def create_identity(
     return user, temp_password
 
 
-async def create_identity_with_id(db: AsyncSession, *, user_id: uuid.UUID, identifier: str, hashed_password: str, is_active: bool) -> User:
+async def create_identity_with_id(
+    db: AsyncSession, *, user_id: uuid.UUID, identifier: str, hashed_password: str, is_active: bool,
+    username: str | None = None,
+) -> User:
     """Preserves an EXPLICITLY SUPPLIED id -- the one operation
     create_identity() above deliberately does not support, since a normal
     admin-created identity should always get a fresh, Blumax-Auth-
@@ -80,8 +89,15 @@ async def create_identity_with_id(db: AsyncSession, *, user_id: uuid.UUID, ident
     existing = await db.execute(select(User).where(User.identifier == identifier))
     if existing.scalar_one_or_none() is not None:
         raise DuplicateIdentifierError(f"identifier already exists: {identifier!r}")
+    if username is not None:
+        existing_username = await db.execute(select(User).where(User.username == username))
+        if existing_username.scalar_one_or_none() is not None:
+            raise DuplicateIdentifierError(f"username already exists: {username!r}")
 
-    user = User(id=user_id, identifier=identifier, hashed_password=hashed_password, is_active=is_active)
+    user = User(
+        id=user_id, identifier=identifier, username=username,
+        hashed_password=hashed_password, is_active=is_active,
+    )
     db.add(user)
     await db.commit()
     await db.refresh(user)

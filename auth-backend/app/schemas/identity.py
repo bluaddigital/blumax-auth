@@ -7,11 +7,13 @@ from pydantic import BaseModel
 class CreateIdentityRequest(BaseModel):
     identifier: str
     password: str | None = None  # omitted -> a random temp password is generated and returned once
+    username: str | None = None  # optional second login identifier, mirroring Core's own email/username duality
 
 
 class CreateIdentityResponse(BaseModel):
     id: str
     identifier: str
+    username: str | None = None
     is_active: bool
     temporary_password: str | None = None  # only present when `password` was omitted
 
@@ -19,6 +21,7 @@ class CreateIdentityResponse(BaseModel):
 class IdentityResponse(BaseModel):
     id: str
     identifier: str
+    username: str | None = None
     is_active: bool
     created_at: datetime
 

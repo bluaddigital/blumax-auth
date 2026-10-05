@@ -81,7 +81,18 @@ Usage (with orphan detection against Labs' own exported core_user_id list):
 Source format (--source-json): a JSON array of objects, each shaped like
 a row from Core's own `users` table:
     [{"id": "<uuid>", "identifier": "...", "hashed_password": "<bcrypt hash>",
-      "is_active": true}, ...]
+      "is_active": true, "username": "..." (optional)}, ...]
+
+`username` (Phase 4H-3, added after the first production gap this
+introduced): Core supports login by either `email` OR `username`
+(app/modules/identity/infrastructure/repository.py::get_by_identifier);
+this tool's source `identifier` field has always meant Core's `email`
+specifically (see EMAIL NORMALIZATION POLICY below), so a migrated
+account silently lost username-login unless `username` is also supplied
+here. Optional and unvalidated beyond being a string -- unlike
+`identifier`, not required, not normalized, not used for duplicate/
+conflict detection (only `identifier`/`id` gate a migration decision);
+a row with no `username` migrates exactly as before.
 
 Labs core_user_id export format (--labs-core-user-ids-json): a plain JSON
 array of core_user_id strings, e.g. ["<uuid>", "<uuid>", ...] -- produced
@@ -130,6 +141,7 @@ class ValidRow:
     raw_identifier: str  # exactly as supplied, for reporting only
     hashed_password: str
     is_active: bool
+    username: str | None = None  # optional, persisted as-supplied -- not normalized, not a comparison key (see module docstring)
 
 
 @dataclass(frozen=True)
@@ -158,9 +170,11 @@ def parse_row(row_number: int, raw: object) -> ValidRow | InvalidRow:
         return InvalidRow(row_number, "INVALID_IS_ACTIVE", "is_active", str(raw["is_active"])[:200])
 
     raw_identifier = str(raw["identifier"])
+    username = raw.get("username")
     return ValidRow(
         row_number=row_number, id=row_id, identifier=normalize_identifier(raw_identifier),
         raw_identifier=raw_identifier, hashed_password=raw["hashed_password"], is_active=raw["is_active"],
+        username=str(username) if username is not None else None,
     )
 
 
@@ -309,7 +323,10 @@ async def apply_plan(db, plan: MigrationPlan) -> ApplyResult:
     result = ApplyResult()
     for row in plan.to_insert:
         try:
-            db.add(User(id=row.id, identifier=row.identifier, hashed_password=row.hashed_password, is_active=row.is_active))
+            db.add(User(
+                id=row.id, identifier=row.identifier, username=row.username,
+                hashed_password=row.hashed_password, is_active=row.is_active,
+            ))
             await db.commit()
             result.migrated.append(row.id)
         except IntegrityError as exc:

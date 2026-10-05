@@ -34,12 +34,13 @@ async def create_identity_route(
 ) -> CreateIdentityResponse:
     try:
         user, temp_password = await identity_service.create_identity(
-            db, identifier=body.identifier, password=body.password,
+            db, identifier=body.identifier, password=body.password, username=body.username,
         )
     except identity_service.DuplicateIdentifierError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     return CreateIdentityResponse(
-        id=str(user.id), identifier=user.identifier, is_active=user.is_active, temporary_password=temp_password,
+        id=str(user.id), identifier=user.identifier, username=user.username,
+        is_active=user.is_active, temporary_password=temp_password,
     )
 
 
@@ -54,7 +55,8 @@ async def get_identity_route(
     except identity_service.IdentityNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Identity not found") from exc
     return IdentityResponse(
-        id=str(user.id), identifier=user.identifier, is_active=user.is_active, created_at=user.created_at,
+        id=str(user.id), identifier=user.identifier, username=user.username,
+        is_active=user.is_active, created_at=user.created_at,
     )
 
 

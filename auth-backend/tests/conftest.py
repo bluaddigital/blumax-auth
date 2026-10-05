@@ -50,7 +50,7 @@ async def db_session():
 @pytest_asyncio.fixture
 async def test_user(db_session: AsyncSession) -> User:
     user = User(
-        id=uuid.uuid4(), identifier="alice@example.test",
+        id=uuid.uuid4(), identifier="alice@example.test", username="alice",
         hashed_password=hash_password("correct-horse-battery-staple"),
         is_active=True,
     )

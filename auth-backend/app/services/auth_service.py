@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 from redis.asyncio import Redis
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import (
@@ -37,7 +37,15 @@ async def login(
     db: AsyncSession, *, identifier: str, password: str,
     user_agent: str | None = None, ip_address: str | None = None,
 ) -> tuple[str, str]:
-    result = await db.execute(select(User).where(User.identifier == identifier))
+    # `identifier` (email) matches exactly, unchanged -- `username` matches
+    # case-insensitively, mirroring Core's own get_by_identifier so an
+    # account migrated from Core keeps logging in the same way it always
+    # did there, by either email or username.
+    result = await db.execute(
+        select(User).where(
+            or_(User.identifier == identifier, func.lower(User.username) == identifier.strip().lower())
+        )
+    )
     user = result.scalar_one_or_none()
 
     # Constant-work password check regardless of whether `user` exists --

@@ -16,6 +16,29 @@ async def test_valid_login_returns_tokens(client: AsyncClient, test_user: User):
     assert body["token_type"] == "bearer"
 
 
+async def test_login_by_username_also_works(client: AsyncClient, test_user: User):
+    # Mirrors Core's own email-OR-username login (see
+    # migrations/versions/003_username.py) -- the same account, the same
+    # password, reached through its username instead of its email.
+    r = await client.post(
+        "/auth/login", json={"identifier": "alice", "password": "correct-horse-battery-staple"}
+    )
+    assert r.status_code == 200
+    assert r.json()["access_token"]
+
+
+async def test_login_by_username_is_case_insensitive(client: AsyncClient, test_user: User):
+    r = await client.post(
+        "/auth/login", json={"identifier": "ALICE", "password": "correct-horse-battery-staple"}
+    )
+    assert r.status_code == 200
+
+
+async def test_login_by_username_wrong_password_rejected(client: AsyncClient, test_user: User):
+    r = await client.post("/auth/login", json={"identifier": "alice", "password": "wrong"})
+    assert r.status_code == 401
+
+
 async def test_invalid_password_rejected(client: AsyncClient, test_user: User):
     r = await client.post("/auth/login", json={"identifier": "alice@example.test", "password": "wrong"})
     assert r.status_code == 401

@@ -64,6 +64,28 @@ async def test_apply_plan_writes_rows_with_preserved_ids(db_session):
     assert written.hashed_password == rows[0].hashed_password
 
 
+async def test_apply_plan_carries_optional_username_through(db_session):
+    # Phase 4H-3: a source row with `username` set must persist it, not
+    # just `identifier` -- the whole point of this field existing.
+    row = _row("core-user-username@example.test")
+    row = ValidRow(**{**row.__dict__, "username": "core_user_username"})
+    plan = await classify(db_session, [row])
+    result = await apply_plan(db_session, plan)
+    assert result.errors == []
+
+    written = (await db_session.execute(select(User).where(User.id == row.id))).scalar_one()
+    assert written.username == "core_user_username"
+
+
+async def test_apply_plan_row_with_no_username_leaves_it_null(db_session):
+    row = _row("core-user-no-username@example.test")
+    plan = await classify(db_session, [row])
+    await apply_plan(db_session, plan)
+
+    written = (await db_session.execute(select(User).where(User.id == row.id))).scalar_one()
+    assert written.username is None
+
+
 async def test_already_migrated_id_is_skipped_not_reinserted(db_session):
     """Idempotency: running the plan twice for the same source row does
     not duplicate or error -- the second pass classifies it as
