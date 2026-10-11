@@ -60,3 +60,23 @@ class Forbidden(AuthError):
     status_code = 403
     error_code = "FORBIDDEN"
     message = "You do not have permission to perform this action"
+
+
+class PatientSessionInactive(AuthError):
+    """A validly signed patient token whose session has been revoked or expired."""
+
+    status_code = 401
+    error_code = "AUTHENTICATION_FAILED"
+    message = "Session is no longer active"
+
+
+class SessionCheckUnavailable(AuthError):
+    """The patient session's state could not be checked, so the request is refused.
+
+    503, not 401: the credentials may be fine — the service just cannot prove
+    it right now — and the patient path fails closed rather than open.
+    """
+
+    status_code = 503
+    error_code = "SESSION_CHECK_UNAVAILABLE"
+    message = "Session verification is temporarily unavailable"
