@@ -35,6 +35,7 @@ from blumax_auth.fastapi import (
 )
 from blumax_auth.jwks import JwksCache
 from blumax_auth.patient import (
+    PATIENT_JWKS_PATH,
     PatientAuth,
     PatientAuthContext,
     PatientTokenVerifier,
@@ -68,6 +69,7 @@ __all__ = [
     "InvalidToken",
     "JwksCache",
     "MissingCredentials",
+    "PATIENT_JWKS_PATH",
     "PatientAuth",
     "PatientAuthContext",
     "PatientSessionInactive",

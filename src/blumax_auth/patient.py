@@ -23,7 +23,7 @@ Typical setup in a patient-facing service:
     from blumax_auth import configure_patients
 
     configure_patients(
-        jwks_url=f"{settings.CORE_API_URL}/.well-known/jwks.json",
+        jwks_url=settings.CORE_API_URL + PATIENT_JWKS_PATH,   # patient keys only
         issuer=settings.JWT_ISSUER,
         audience="blumax-patient",
         session_checker=core_session_checker(settings.CORE_API_URL),
@@ -183,6 +183,13 @@ _patient_verifier: PatientTokenVerifier | None = None
 _patient_jwks: JwksCache | None = None
 _session_checker: SessionChecker | None = None
 
+# Core publishes the patient signing key ONLY here (K1), never in the staff
+# /.well-known/jwks.json -- so a patient token's signature cannot verify against
+# staff keys, and a patient-shaped token signed with a staff key cannot verify
+# here.
+PATIENT_JWKS_PATH = "/.well-known/patient-jwks.json"
+_STAFF_JWKS_PATH = "/.well-known/jwks.json"
+
 
 def configure_patients(
     *,
@@ -199,6 +206,13 @@ def configure_patients(
     global _patient_verifier, _patient_jwks, _session_checker
     if session_checker is None or not callable(session_checker):
         raise ValueError("configure_patients requires a session_checker")
+    if jwks_url.split("?", 1)[0].rstrip("/").endswith(_STAFF_JWKS_PATH):
+        # The staff key set would let the staff signing key vouch for patient
+        # tokens -- exactly what Core's separate patient key prevents.
+        raise ValueError(
+            f"configure_patients needs Core's patient key set ({PATIENT_JWKS_PATH}), "
+            "not the staff JWKS"
+        )
     _patient_jwks = JwksCache(jwks_url, ttl_seconds=ttl_seconds)
     _patient_verifier = PatientTokenVerifier(
         _patient_jwks, issuer=issuer, audience=audience, leeway_seconds=leeway_seconds

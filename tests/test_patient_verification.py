@@ -310,6 +310,28 @@ class TestRequirePatient:
                 session_checker=None,  # type: ignore[arg-type]
             )
 
+    @pytest.mark.parametrize("url", [
+        "https://core.example/.well-known/jwks.json",
+        "https://core.example/.well-known/jwks.json/",
+        "https://core.example/.well-known/jwks.json?v=2",
+        "http://core:8000/.well-known/jwks.json",
+    ])
+    def test_the_staff_jwks_is_refused_as_the_patient_key_set(self, url):
+        """K1: the staff key set would let the staff signing key vouch for
+        patient tokens; Core publishes patient keys at a separate path."""
+        with pytest.raises(ValueError, match="patient key set"):
+            blumax_auth.configure_patients(
+                jwks_url=url, issuer=ISSUER, audience=PATIENT_AUD, session_checker=_active,
+            )
+
+    def test_the_patient_jwks_path_is_accepted(self):
+        assert blumax_auth.PATIENT_JWKS_PATH == "/.well-known/patient-jwks.json"
+        blumax_auth.configure_patients(
+            jwks_url="https://core.example" + blumax_auth.PATIENT_JWKS_PATH,
+            issuer=ISSUER, audience=PATIENT_AUD, session_checker=_active,
+        )
+        blumax_auth.reset_patients()
+
     async def test_unconfigured_patient_path_does_not_admit_anyone(self, signer):
         blumax_auth.reset_patients()
         app = FastAPI()
