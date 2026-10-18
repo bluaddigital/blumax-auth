@@ -814,3 +814,66 @@ class TestNoPermissionsInTokens:
         r = await client.get("/consult", headers=h)
         assert r.status_code == 200
         assert set(r.json()) == {"user_id", "tenant_id"}
+
+
+# ─── check_permission — the inline-callable form ───────────────────────────────
+
+class TestCheckPermission:
+    """For a check that can't be a route-level Depends because whether it
+    applies at all depends on the parsed request body (e.g. OT's
+    emergency_override flag) — same Core-backed answer as require_permission(),
+    returned as a bool so the caller decides what "no" means."""
+
+    def _ctx(self, **over) -> AuthContext:
+        defaults = dict(
+            user_id=uuid.uuid4(), tenant_id=uuid.uuid4(), tenant_slug="t", role="R",
+            archetype="CLINICIAN", facility_ids=None, person_id=None, provider_id=None,
+            is_platform_admin=False, jti="j",
+        )
+        defaults.update(over)
+        return AuthContext(**defaults)
+
+    async def test_true_when_the_code_is_held(self, signer, core, clock):
+        _configure(core, clock)
+        ctx = self._ctx()
+        token = signer.token()
+        core.grant(token, CODE)
+        assert await blumax_auth.check_permission(ctx, token, CODE) is True
+
+    async def test_false_when_the_code_is_not_held(self, signer, core, clock):
+        _configure(core, clock)
+        ctx = self._ctx()
+        token = signer.token()
+        core.grant(token, "some.other.code")
+        assert await blumax_auth.check_permission(ctx, token, CODE) is False
+
+    async def test_a_platform_admin_always_passes_without_asking_core(self, signer, core, clock):
+        _configure(core, clock)
+        ctx = self._ctx(is_platform_admin=True)
+        token = signer.token()
+        # No core.grant(token, ...) call — if this reached Core it would 401.
+        assert await blumax_auth.check_permission(ctx, token, CODE) is True
+        assert core.calls == 0
+
+    async def test_an_unreachable_core_raises_same_as_the_dependencys_enforce_mode(self, signer, core, clock):
+        _configure(core, clock)
+        core.fail = httpx.ConnectError("boom")
+        ctx = self._ctx()
+        token = signer.token()
+        with pytest.raises(blumax_auth.PermissionCheckUnavailable):
+            await blumax_auth.check_permission(ctx, token, CODE)
+
+    async def test_unconfigured_raises_rather_than_silently_allowing(self, signer):
+        blumax_auth.reset_permissions()
+        ctx = self._ctx()
+        with pytest.raises(RuntimeError):
+            await blumax_auth.check_permission(ctx, signer.token(), CODE)
+
+    async def test_uses_the_same_cache_as_require_permission(self, signer, core, clock):
+        _configure(core, clock)
+        ctx = self._ctx()
+        token = signer.token()
+        core.grant(token, CODE)
+        assert await blumax_auth.check_permission(ctx, token, CODE) is True
+        assert await blumax_auth.check_permission(ctx, token, CODE) is True
+        assert core.calls == 1

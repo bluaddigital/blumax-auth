@@ -407,6 +407,34 @@ def require_permission(code: str, *, mode: Mode = "enforce") -> Callable[..., ob
     return _check
 
 
+async def check_permission(ctx: AuthContext, token: str, code: str) -> bool:
+    """Whether `ctx`'s role holds `code`, per Core — for a check that can't be
+    expressed as a route-level `require_permission()` dependency because
+    whether it applies at all depends on something only known once the
+    request body is parsed (e.g. an `emergency_override: bool` field), not
+    just on which route was hit.
+
+    Same source of truth as `require_permission()` (Core's own
+    GET /api/v1/me/permissions, cached the same way) — just returned as a
+    bool instead of raising, so the caller decides what "no" means for that
+    one call site, including its own warn/enforce rollout mode if it wants
+    one.
+
+    Raises the same `AuthError` subclasses `require_permission()`'s
+    dependency does when Core can't be asked at all (unreachable, malformed
+    response, `configure_permissions()` never called) — a caller that wants
+    warn-mode semantics (log and allow) should catch `AuthError` itself, the
+    same way `require_permission(mode="warn")` does internally.
+    """
+    if ctx.is_platform_admin:
+        return True
+    checker = _checker
+    if checker is None:
+        raise RuntimeError("blumax_auth.configure_permissions() has not been called")
+    answer = await checker.granted(ctx, token)
+    return code in answer.codes
+
+
 def _reason_for(exc: AuthError) -> str:
     if isinstance(exc, PermissionCheckUnavailable):
         return "core_unavailable"

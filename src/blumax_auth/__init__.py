@@ -48,6 +48,7 @@ from blumax_auth.patient import (
 from blumax_auth.permissions import (
     PermissionCheckUnavailable,
     aclose_permissions,
+    check_permission,
     configure_permissions,
     require_permission,
     reset_permissions,
@@ -82,6 +83,7 @@ __all__ = [
     "TokenVerifier",
     "aclose_permissions",
     "aclose_session_revocation",
+    "check_permission",
     "check_session_revocation",
     "configure",
     "configure_patients",
