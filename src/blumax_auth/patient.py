@@ -110,7 +110,17 @@ class PatientTokenVerifier:
                 algorithms=[ALGORITHM],
                 audience=self._audience,
                 issuer=self._issuer,
-                options={"leeway": self._leeway},
+                options={
+                    "leeway": self._leeway,
+                    # A token with no exp never expires; with no aud / iat it
+                    # escapes the audience check and the session-revocation
+                    # comparison. jose only validates these claims WHEN
+                    # PRESENT unless told to require them. Core always mints
+                    # all three (app/core/security.py).
+                    "require_exp": True,
+                    "require_aud": True,
+                    "require_iat": True,
+                },
             )
         except JWTError as exc:
             raise InvalidToken() from exc
