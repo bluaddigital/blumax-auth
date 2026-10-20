@@ -12,16 +12,29 @@ Core publishes the current key and, during a rotation, the retiring one. A
 token whose `kid` is not in the cache triggers exactly one refetch (rate-limited
 so an attacker cannot turn unknown kids into a request amplifier against Core).
 That is what lets Core rotate without every service restarting in lockstep.
+
+Maximum stale age
+-----------------
+While Core is unreachable the cache keeps serving the keys it holds, so a Core
+outage does not stop authentication. That grace is bounded: once the keys are
+older than `max_stale_seconds` (default 24h; env BLUMAX_AUTH_JWKS_MAX_STALE_SECONDS
+when the argument is not given; 0 disables the bound) and a refresh still
+fails, verification fails closed. Otherwise a key Core has withdrawn (e.g. a
+compromised key rotated out) would be trusted indefinitely by a service that
+cannot reach Core.
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Any
 
 import httpx
 
 from blumax_auth.errors import InvalidToken
+
+DEFAULT_MAX_STALE_SECONDS = 24 * 3600.0
 
 
 class JwksCache:
@@ -34,6 +47,7 @@ class JwksCache:
         ttl_seconds: float = 3600.0,
         timeout_seconds: float = 5.0,
         min_refetch_interval: float = 10.0,
+        max_stale_seconds: float | None = None,
     ) -> None:
         self._url = jwks_url
         self._ttl = ttl_seconds
@@ -41,6 +55,18 @@ class JwksCache:
         # Floor between unknown-kid refetches. Without it, a stream of tokens
         # carrying random kids becomes a request amplifier pointed at Core.
         self._min_refetch_interval = min_refetch_interval
+
+        if max_stale_seconds is None:
+            raw = os.environ.get("BLUMAX_AUTH_JWKS_MAX_STALE_SECONDS", "").strip()
+            try:
+                max_stale_seconds = float(raw) if raw else DEFAULT_MAX_STALE_SECONDS
+            except ValueError as exc:
+                raise ValueError(
+                    "BLUMAX_AUTH_JWKS_MAX_STALE_SECONDS must be a number of seconds"
+                ) from exc
+        if max_stale_seconds < 0:
+            raise ValueError("max_stale_seconds must be >= 0 (0 disables the bound)")
+        self._max_stale = max_stale_seconds
 
         self._keys: dict[str, dict[str, Any]] = {}
         self._fetched_at: float = 0.0
@@ -70,6 +96,7 @@ class JwksCache:
             return key
 
         await self._refresh(force=False)
+        self._enforce_max_stale()
         if (key := self._match(kid)) is not None:
             return key
 
@@ -77,10 +104,20 @@ class JwksCache:
         # yet, or a forged header. One more fetch distinguishes them.
         if time.monotonic() - self._last_attempt >= self._min_refetch_interval:
             await self._refresh(force=True)
+            self._enforce_max_stale()
             if (key := self._match(kid)) is not None:
                 return key
 
         raise InvalidToken("Token signed with an unrecognised key")
+
+    def _enforce_max_stale(self) -> None:
+        """Fail closed if the held keys are older than the hard stale bound."""
+        if (
+            self._max_stale > 0
+            and self._keys
+            and (time.monotonic() - self._fetched_at) > self._max_stale
+        ):
+            raise InvalidToken("Cannot verify tokens: signing keys are too stale")
 
     def _match(self, kid: str | None) -> dict[str, Any] | None:
         if kid:
@@ -93,7 +130,9 @@ class JwksCache:
         return None
 
     def _is_fresh(self) -> bool:
-        return bool(self._keys) and (time.monotonic() - self._fetched_at) < self._ttl
+        # Never "fresh" past the stale bound, even if it was set below the TTL.
+        limit = min(self._ttl, self._max_stale) if self._max_stale > 0 else self._ttl
+        return bool(self._keys) and (time.monotonic() - self._fetched_at) < limit
 
     async def _refresh(self, *, force: bool) -> None:
         async with self._lock:

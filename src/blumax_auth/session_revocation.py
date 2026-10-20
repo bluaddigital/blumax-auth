@@ -75,16 +75,27 @@ plain, STRICT `issued_at` comparison with no slack: `issued_at <= revoked_at`
 means revoked, full stop. Every session other than an explicitly exempted one
 is revoked, regardless of how close in time it was issued.
 
-Fail open, on purpose
-----------------------
-Matching every other fail-open posture in this package (an unreachable JWKS
-endpoint keeps serving its last-cached keys — require_permission's
-Core-unavailable path is the one deliberate exception, and it says so loudly
-in its own docstring): a Redis outage here is read as "nothing to revoke",
-never as a reason to reject the request. This check is a security
-IMPROVEMENT layered on top of signature/expiry verification, never a
-replacement for it — losing the shared Redis must not turn into an outage of
-its own for every service that opted in.
+Redis-failure policy: fail_mode ("open" default | "closed")
+-------------------------------------------------------------
+This check is layered on top of signature/expiry verification, so by default
+a Redis problem (unreachable, or a malformed marker) is read as "nothing to
+revoke" and the request passes: losing the shared Redis must not turn into an
+outage of every service that opted in. That is `fail_mode="open"`, controlled
+degradation: it is never silent. EVERY such outcome logs a WARNING with the
+message `redis_unavailable` (reason=redis_unavailable | marker_malformed, plus
+user_id and mode) in warn AND enforce mode, so it can be alerted on.
+
+`fail_mode="closed"` (configure_session_revocation(..., fail_mode="closed"),
+or env SESSION_REVOCATION_FAIL_MODE when the argument is not given): in
+enforce mode a redis_unavailable / marker_malformed outcome is rejected with
+the SAME 401 (InvalidToken) a revoked session gets - deliberately not a 503,
+so clients keep a single "re-authenticate" path. Choose closed for services
+whose endpoints move money or change clinical records irreversibly, where
+honouring a session Core already revoked matters more than availability.
+The tradeoff: while the shared Redis is down EVERY authenticated request to a
+closed service is refused, so closed turns a Redis outage into an outage of
+that service. fail_mode is service-wide (like mode); warn mode never rejects,
+whatever fail_mode says.
 
 Rollout mode
 ------------
@@ -126,6 +137,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Literal
 
@@ -141,6 +153,8 @@ if TYPE_CHECKING:
 _log = logging.getLogger("blumax_auth.session_revocation")
 
 Mode = Literal["enforce", "warn"]
+FailMode = Literal["open", "closed"]
+FAIL_MODE_ENV = "SESSION_REVOCATION_FAIL_MODE"
 
 
 def _key(user_id: object) -> str:
@@ -162,9 +176,10 @@ def _exempt_key(user_id: object, jti: str) -> str:
 class _Checker:
     """One configured Redis connection plus the mode it defaults to."""
 
-    def __init__(self, redis: Redis, *, mode: Mode) -> None:
+    def __init__(self, redis: Redis, *, mode: Mode, fail_mode: FailMode = "open") -> None:
         self.redis = redis
         self.mode = mode
+        self.fail_mode = fail_mode
 
     async def is_revoked(
         self, user_id: object, issued_at: datetime | None, jti: str | None
@@ -216,7 +231,9 @@ class _Checker:
 _checker: _Checker | None = None
 
 
-def configure_session_revocation(redis_url: str, *, mode: Mode = "warn") -> None:
+def configure_session_revocation(
+    redis_url: str, *, mode: Mode = "warn", fail_mode: FailMode | None = None
+) -> None:
     """Point this service at the shared Redis for session-revocation checks.
 
     Call once, at service startup — the same shape as configure_permissions().
@@ -234,6 +251,10 @@ def configure_session_revocation(redis_url: str, *, mode: Mode = "warn") -> None
     mode       "warn" (default) or "enforce" — see the module docstring's
                "Rollout mode" section. check_session_revocation() honors
                whichever was set here.
+    fail_mode  "open" (default) or "closed" - what enforce mode does when
+               Redis is unavailable; see "Redis-failure policy" in the module
+               docstring. When None, read from env SESSION_REVOCATION_FAIL_MODE
+               (unset/empty -> "open"). An invalid value raises ValueError.
     """
     global _checker
     if not redis_url or not redis_url.strip():
@@ -241,9 +262,16 @@ def configure_session_revocation(redis_url: str, *, mode: Mode = "warn") -> None
     if mode not in ("enforce", "warn"):
         raise ValueError(f"mode must be 'enforce' or 'warn', got {mode!r}")
 
+    if fail_mode is None:
+        fail_mode = os.environ.get(FAIL_MODE_ENV, "").strip().lower() or "open"  # type: ignore[assignment]
+    if fail_mode not in ("open", "closed"):
+        raise ValueError(f"fail_mode must be 'open' or 'closed', got {fail_mode!r}")
+
     import redis.asyncio as aioredis  # noqa: PLC0415 — optional dep, only needed if this is used
 
-    _checker = _Checker(aioredis.Redis.from_url(redis_url, decode_responses=True), mode=mode)
+    _checker = _Checker(
+        aioredis.Redis.from_url(redis_url, decode_responses=True), mode=mode, fail_mode=fail_mode
+    )
 
 
 async def aclose_session_revocation() -> None:
@@ -298,14 +326,23 @@ async def check_session_revocation(
     revoked, reason, revoked_at = await checker.is_revoked(ctx.user_id, ctx.issued_at, ctx.jti)
 
     if reason is not None:
-        # Ambiguous outcomes are never revoked (fail-open). In warn mode,
-        # distinguish a real check failure (redis_unavailable /
-        # marker_malformed) from a check that simply didn't apply
-        # (no_issued_at) so the log is honest about which happened —
-        # both already resolve to "not rejected" either way.
+        failed = reason in ("redis_unavailable", "marker_malformed")
+        if failed:
+            # Always visible, in either mode and either fail_mode, so the
+            # degradation can be alerted on (see "Redis-failure policy").
+            _log.warning(
+                "redis_unavailable",
+                extra={
+                    "reason": reason,
+                    "mode": checker.mode,
+                    "fail_mode": checker.fail_mode,
+                    "user_id": str(ctx.user_id),
+                },
+            )
         if checker.mode == "warn":
-            decision = "check_failed" if reason in ("redis_unavailable", "marker_malformed") else "allow"
-            _emit(ctx, decision=decision, reason=reason)
+            _emit(ctx, decision="check_failed" if failed else "allow", reason=reason)
+        elif failed and checker.fail_mode == "closed":
+            raise InvalidToken("Session has been revoked")
         return
 
     if revoked:
