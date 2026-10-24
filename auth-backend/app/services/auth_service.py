@@ -153,7 +153,17 @@ async def logout(
         row.revoked = True
     await db.commit()
 
-    await revoke_user_sessions(redis, str(row.user_id))
+    # Only an explicit "log out everywhere" should end every other active
+    # session's access token. Concurrent logins across devices/tabs are
+    # intended platform behavior (confirmed 2026-09-23) -- calling this
+    # unconditionally meant one ordinary single-device logout silently ended
+    # every other session for that account, which is exactly what surfaced as
+    # unexplained logouts on a shared/test account used from multiple places
+    # at once. An ordinary logout here still revokes its own refresh token
+    # above; its access token dies at its own expiry, same as before this
+    # revocation mechanism existed.
+    if all_devices:
+        await revoke_user_sessions(redis, str(row.user_id))
     logger.info("logout.success", user_id=str(row.user_id), all_devices=all_devices)
 
 

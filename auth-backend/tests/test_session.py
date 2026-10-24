@@ -41,23 +41,49 @@ async def test_logout_revokes_refresh_token(client: AsyncClient, test_user: User
     assert r.status_code == 401
 
 
-async def test_logout_revokes_still_unexpired_access_token(client: AsyncClient, test_user: User):
-    """The whole point of the Redis session-revocation marker: an access
-    token that hasn't naturally expired yet must stop being honoured the
-    moment its owner logs out."""
-    login = await client.post(
+async def test_ordinary_logout_does_not_revoke_other_sessions(client: AsyncClient, test_user: User):
+    """An ordinary (all_devices=False) logout must only end the session doing
+    the logging out, never every other concurrent session for that account —
+    concurrent logins are intended platform behavior (confirmed 2026-09-23).
+
+    The Redis revocation marker is per-USER, not per-session, so there is no
+    way to narrowly kill only the logging-out session's own access token
+    without also killing every other one; revoke_user_sessions is therefore
+    called ONLY for an explicit all_devices logout. An ordinary logout's own
+    access token is left to expire on its own schedule, same as before this
+    revocation mechanism existed -- this is the accepted trade-off for not
+    silently ending other devices' sessions (found live: a shared/test
+    account used from multiple places at once was being logged out of
+    unexpectedly every time any one of those sessions logged out normally)."""
+    session_a = await client.post(
         "/auth/login", json={"identifier": "alice@example.test", "password": "correct-horse-battery-staple"}
     )
-    access = login.json()["access_token"]
-    refresh = login.json()["refresh_token"]
+    session_b = await client.post(
+        "/auth/login", json={"identifier": "alice@example.test", "password": "correct-horse-battery-staple"}
+    )
+    access_b = session_b.json()["access_token"]
+    refresh_a = session_a.json()["refresh_token"]
 
-    me_before = await client.get("/auth/me", headers={"Authorization": f"Bearer {access}"})
-    assert me_before.status_code == 200
+    await client.post("/auth/logout", json={"refresh_token": refresh_a})
 
-    await client.post("/auth/logout", json={"refresh_token": refresh})
+    me_b = await client.get("/auth/me", headers={"Authorization": f"Bearer {access_b}"})
+    assert me_b.status_code == 200
 
-    me_after = await client.get("/auth/me", headers={"Authorization": f"Bearer {access}"})
-    assert me_after.status_code == 401
+
+async def test_all_devices_logout_revokes_every_session(client: AsyncClient, test_user: User):
+    session_a = await client.post(
+        "/auth/login", json={"identifier": "alice@example.test", "password": "correct-horse-battery-staple"}
+    )
+    session_b = await client.post(
+        "/auth/login", json={"identifier": "alice@example.test", "password": "correct-horse-battery-staple"}
+    )
+    access_b = session_b.json()["access_token"]
+    refresh_a = session_a.json()["refresh_token"]
+
+    await client.post("/auth/logout", json={"refresh_token": refresh_a, "all_devices": True})
+
+    me_b = await client.get("/auth/me", headers={"Authorization": f"Bearer {access_b}"})
+    assert me_b.status_code == 401
 
 
 async def test_missing_bearer_rejected(client: AsyncClient):
@@ -83,7 +109,9 @@ async def test_revocation_marker_is_written_as_an_iso_timestamp_on_the_wire(
     )
     refresh = login.json()["refresh_token"]
 
-    await client.post("/auth/logout", json={"refresh_token": refresh})
+    # all_devices=True: an ordinary logout no longer writes this marker at
+    # all (see test_ordinary_logout_does_not_revoke_other_sessions).
+    await client.post("/auth/logout", json={"refresh_token": refresh, "all_devices": True})
 
     marker = await _fresh_redis_per_test.get(f"session_revoked_at:{test_user.id}")
     assert marker is not None
