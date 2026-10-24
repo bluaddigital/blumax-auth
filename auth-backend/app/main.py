@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.identity_routes import identity_router
+from app.api.internal_routes import internal_router
 from app.api.password_routes import password_router
 from app.api.routes import health_router, jwks_router, router
 from app.api.service_routes import service_router
@@ -57,6 +58,7 @@ def create_app() -> FastAPI:
     app.include_router(service_router)
     app.include_router(password_router)
     app.include_router(identity_router)
+    app.include_router(internal_router)
     return app
 
 

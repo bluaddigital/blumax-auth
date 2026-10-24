@@ -126,6 +126,17 @@ class Settings(BaseSettings):
     PASSWORD_RESET_TTL_SECONDS: int = 15 * 60
     PASSWORD_MIN_LENGTH: int = 8
 
+    # --- Core user sync (2026-10-24) -----------------------------------------
+    # This service's own `users` table is a one-way mirror of Core's --
+    # seeded once by scripts/migrate_core_user.py, kept current afterward
+    # only by Core's own blumax_auth_user_sync_relay.py calling POST
+    # /internal/users/sync. Checked against a static shared-secret header
+    # (X-Blumax-Auth-User-Sync-Key), the same one-key-per-consumer-direction
+    # convention Core's own relays already use for calling OUT to Pharmacy/
+    # Labs -- simpler than this service's own OAuth-style service-account
+    # tokens (Phase 5) for a single internal, platform-fixed caller.
+    CORE_USER_SYNC_SERVICE_KEY: str = "dev-blumax-auth-user-sync-key-change-me"
+
     @property
     def is_production(self) -> bool:
         return self.ENVIRONMENT == "production"
