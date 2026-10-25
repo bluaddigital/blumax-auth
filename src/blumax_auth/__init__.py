@@ -23,6 +23,7 @@ from blumax_auth.fastapi import (
     Auth,
     PlatformAdminAuth,
     TenantAuth,
+    TrustAnchor,
     configure,
     install_error_handler,
     jwks_cache,
@@ -59,7 +60,7 @@ from blumax_auth.session_revocation import (
     configure_session_revocation,
     reset_session_revocation,
 )
-from blumax_auth.verify import TokenVerifier
+from blumax_auth.verify import MultiIssuerTokenVerifier, TokenVerifier
 
 __all__ = [
     "Auth",
@@ -70,6 +71,7 @@ __all__ = [
     "InvalidToken",
     "JwksCache",
     "MissingCredentials",
+    "MultiIssuerTokenVerifier",
     "PATIENT_JWKS_PATH",
     "PatientAuth",
     "PatientAuthContext",
@@ -81,6 +83,7 @@ __all__ = [
     "TenantContextMissing",
     "TenantMismatch",
     "TokenVerifier",
+    "TrustAnchor",
     "aclose_permissions",
     "aclose_session_revocation",
     "check_permission",
