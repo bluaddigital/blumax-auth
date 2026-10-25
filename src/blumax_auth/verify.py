@@ -77,6 +77,53 @@ class TokenVerifier:
 
         return _to_context(claims, is_service=token_type == "service")
 
+    @property
+    def issuer(self) -> str:
+        """Read-only -- MultiIssuerTokenVerifier routes on this; nothing
+        else in this package needs to see a single verifier's own issuer."""
+        return self._issuer
+
+
+class MultiIssuerTokenVerifier:
+    """Accepts a token from any of several trusted issuers, each with its
+    own JWKS/audience/leeway -- a real dual-issuer trust anchor, for a
+    service mid-migration between two token issuers (e.g. Core and Blumax
+    Auth) that must keep accepting BOTH during the transition window.
+
+    Found needed 2026-10-25: a single TokenVerifier can only ever trust one
+    issuer, so a consumer's naive "swap configure()'s issuer/jwks_url"
+    migration approach is a hard cutover, not a staged rollout -- it
+    silently rejects a still-valid token from whichever issuer isn't
+    currently selected. This class is what a genuine dual-issuer window
+    actually requires.
+
+    Routing is by the token's own (unverified) `iss` claim -- reading it
+    before verification is a ROUTING decision only, never a trust one: the
+    chosen TokenVerifier still independently re-checks signature, issuer,
+    audience and expiry against that specific issuer's own JWKS, exactly
+    as if it had been the only verifier configured. A token claiming an
+    issuer it cannot actually prove (wrong signature, or an issuer absent
+    from `verifiers`) is refused the same as today, never silently routed
+    to the wrong key set.
+    """
+
+    def __init__(self, verifiers: list[TokenVerifier]) -> None:
+        if not verifiers:
+            raise ValueError("MultiIssuerTokenVerifier needs at least one TokenVerifier")
+        self._by_issuer = {v.issuer: v for v in verifiers}
+
+    async def verify(self, token: str) -> AuthContext:
+        try:
+            unverified = jwt.get_unverified_claims(token)
+        except JWTError as exc:
+            raise InvalidToken("Malformed token") from exc
+
+        issuer = unverified.get("iss")
+        verifier = self._by_issuer.get(issuer)
+        if verifier is None:
+            raise InvalidToken(f"Untrusted issuer: {issuer!r}")
+        return await verifier.verify(token)
+
 
 def _issued_at(claims: dict[str, Any]) -> datetime | None:
     """The token's "iat" claim as an aware UTC datetime.

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import Depends, Header, Request
@@ -34,12 +35,26 @@ from blumax_auth.errors import (
     TenantMismatch,
 )
 from blumax_auth.jwks import JwksCache
-from blumax_auth.verify import TokenVerifier
+from blumax_auth.verify import MultiIssuerTokenVerifier, TokenVerifier
 
 _bearer = HTTPBearer(auto_error=False)
 
-_verifier: TokenVerifier | None = None
+_verifier: TokenVerifier | MultiIssuerTokenVerifier | None = None
 _jwks: JwksCache | None = None
+
+
+@dataclass(frozen=True)
+class TrustAnchor:
+    """One additional issuer to accept alongside `configure()`'s primary
+    one -- see `also_trust` below and MultiIssuerTokenVerifier's own
+    docstring for why a staged issuer migration needs this rather than
+    just swapping the primary jwks_url/issuer/audience in place."""
+
+    jwks_url: str
+    issuer: str
+    audience: str
+    ttl_seconds: float = 3600.0
+    leeway_seconds: int = 30
 
 
 def configure(
@@ -49,13 +64,35 @@ def configure(
     audience: str,
     ttl_seconds: float = 3600.0,
     leeway_seconds: int = 30,
+    also_trust: list[TrustAnchor] | None = None,
 ) -> None:
-    """Point this service at Core's key set. Call once, at app startup."""
+    """Point this service at Core's key set. Call once, at app startup.
+
+    `also_trust` (2026-10-25): additional issuers to accept alongside the
+    primary one, for a service mid-migration between two token issuers
+    (e.g. Core -> Blumax Auth) that must keep honouring both during the
+    transition window -- found needed live when a naive single-issuer
+    swap turned out to be a hard cutover, not a staged rollout (see
+    MultiIssuerTokenVerifier's own docstring). Omitted (the default):
+    zero behavior change from before this parameter existed -- every
+    existing caller of configure() is unaffected."""
     global _verifier, _jwks
     _jwks = JwksCache(jwks_url, ttl_seconds=ttl_seconds)
-    _verifier = TokenVerifier(
+    primary = TokenVerifier(
         _jwks, issuer=issuer, audience=audience, leeway_seconds=leeway_seconds
     )
+    if not also_trust:
+        _verifier = primary
+        return
+
+    verifiers = [primary]
+    for anchor in also_trust:
+        cache = JwksCache(anchor.jwks_url, ttl_seconds=anchor.ttl_seconds)
+        verifiers.append(TokenVerifier(
+            cache, issuer=anchor.issuer, audience=anchor.audience,
+            leeway_seconds=anchor.leeway_seconds,
+        ))
+    _verifier = MultiIssuerTokenVerifier(verifiers)
 
 
 def jwks_cache() -> JwksCache:
@@ -63,6 +100,21 @@ def jwks_cache() -> JwksCache:
     if _jwks is None:
         raise RuntimeError("blumax_auth.configure() has not been called")
     return _jwks
+
+
+def verifier() -> TokenVerifier | MultiIssuerTokenVerifier:
+    """The live, fully-configured verifier -- single-issuer or
+    dual-issuer, whichever `configure()` set up. For a service whose own
+    code independently re-verifies a token outside this package's own
+    `require_auth`/`TenantAuth` dependencies (found live 2026-10-25: Labs'
+    own decode_core_token built a brand-new single-issuer TokenVerifier on
+    every call, from settings.JWT_ISSUER/jwks_cache() alone, silently
+    bypassing whatever `also_trust` configure() had actually set up) --
+    call this instead of constructing a new TokenVerifier by hand, so a
+    dual-trust window applies there too."""
+    if _verifier is None:
+        raise RuntimeError("blumax_auth.configure() has not been called")
+    return _verifier
 
 
 def reset() -> None:
