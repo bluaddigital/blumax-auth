@@ -32,9 +32,17 @@ async def login_route(
 
     try:
         access_token, refresh_token = await auth_service.login(
-            db, identifier=body.identifier, password=body.password,
+            db, identifier=body.identifier, password=body.password, tenant_id=body.tenant_id,
             user_agent=request.headers.get("user-agent"), ip_address=client_ip,
         )
+    except auth_service.TenantSelectionRequiredError as exc:
+        # 409, not 400: the request is well-formed, it's the account state
+        # that makes it ambiguous -- same posture as Core's own identical
+        # exception (app/core/exceptions.py there).
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"error_code": "TENANT_SELECTION_REQUIRED", "tenant_ids": [str(t) for t in exc.tenant_ids]},
+        ) from exc
     except auth_service.AuthenticationError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
 
@@ -44,7 +52,14 @@ async def login_route(
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh_route(body: RefreshRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
     try:
-        access_token, refresh_token = await auth_service.refresh(db, refresh_token=body.refresh_token)
+        access_token, refresh_token = await auth_service.refresh(
+            db, refresh_token=body.refresh_token, tenant_id=body.tenant_id,
+        )
+    except auth_service.TenantSelectionRequiredError as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"error_code": "TENANT_SELECTION_REQUIRED", "tenant_ids": [str(t) for t in exc.tenant_ids]},
+        ) from exc
     except auth_service.AuthenticationError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
     return TokenResponse(access_token=access_token, refresh_token=refresh_token)
@@ -74,6 +89,8 @@ async def me_route(
     identifier = await auth_service.get_identifier(db, user_id=claims["sub"])
     return MeResponse(
         sub=claims["sub"], iss=claims["iss"], aud=claims["aud"], type=claims["type"], identifier=identifier,
+        tid=claims.get("tid"), tsl=claims.get("tsl"), rol=claims.get("rol"),
+        arc=claims.get("arc"), fac=claims.get("fac"),
     )
 
 

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import uuid
+
 from pydantic import BaseModel
 
 
 class LoginRequest(BaseModel):
     identifier: str
     password: str
+    # Required only when the account holds more than one active tenant
+    # membership (see auth_service.TenantSelectionRequiredError) -- same
+    # shape as Core's own LoginCommand.tenant_id.
+    tenant_id: uuid.UUID | None = None
 
 
 class TokenResponse(BaseModel):
@@ -16,6 +22,11 @@ class TokenResponse(BaseModel):
 
 class RefreshRequest(BaseModel):
     refresh_token: str
+    # The tenant binding is preserved across a refresh -- see Core's own
+    # AuthService.refresh docstring for why this is supplied by the
+    # caller rather than stored server-side: the client remembers which
+    # tenant it's bound to and resends it on every refresh, same as login.
+    tenant_id: uuid.UUID | None = None
 
 
 class LogoutRequest(BaseModel):
@@ -38,3 +49,12 @@ class MeResponse(BaseModel):
     # all (a verified token implies the row exists, since there is
     # nothing else `sub` could have come from).
     identifier: str | None = None
+    # 2026-10-25: surfaced straight from the token's own claims (never
+    # re-resolved here) when present -- same abbreviated names as the JWT
+    # itself (tid/tsl/rol/arc/fac), so a caller already parsing Core's
+    # /auth/me shape needs no new field names.
+    tid: str | None = None
+    tsl: str | None = None
+    rol: str | None = None
+    arc: str | None = None
+    fac: list[str] | None = None

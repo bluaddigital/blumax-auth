@@ -7,7 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
 from app.core.config import settings
-from app.schemas.internal import UserSyncRequest
+from app.schemas.internal import MembershipRevokedRequest, MembershipSyncRequest, UserSyncRequest
+from app.services.membership_sync_service import revoke_membership_from_core, sync_membership_from_core
 from app.services.user_sync_service import UserSyncConflictError, sync_user_from_core
 
 internal_router = APIRouter(prefix="/internal", tags=["internal"])
@@ -43,3 +44,29 @@ async def sync_user_route(
         )
     except UserSyncConflictError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+
+@internal_router.post(
+    "/memberships/sync",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_core_user_sync_key)],
+)
+async def sync_membership_route(
+    body: MembershipSyncRequest, db: AsyncSession = Depends(get_db),
+) -> None:
+    await sync_membership_from_core(
+        db, user_id=body.user_id, tenant_id=body.tenant_id, tenant_slug=body.tenant_slug,
+        role_name=body.role_name, role_archetype=body.role_archetype,
+        facility_ids=body.facility_ids,
+    )
+
+
+@internal_router.post(
+    "/memberships/revoke",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_core_user_sync_key)],
+)
+async def revoke_membership_route(
+    body: MembershipRevokedRequest, db: AsyncSession = Depends(get_db),
+) -> None:
+    await revoke_membership_from_core(db, user_id=body.user_id, tenant_id=body.tenant_id)

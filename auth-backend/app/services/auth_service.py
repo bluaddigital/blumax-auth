@@ -24,6 +24,7 @@ from app.core.security import (
 )
 from app.core.session_revocation import is_session_revoked, revoke_user_sessions
 from app.models.refresh_token import RefreshToken
+from app.models.tenant_membership import TenantMembership
 from app.models.user import User
 
 logger = structlog.get_logger(__name__)
@@ -33,8 +34,55 @@ class AuthenticationError(Exception):
     pass
 
 
+class TenantSelectionRequiredError(Exception):
+    """Mirrors Core's own exception of the same name -- the account holds
+    more than one active tenant_memberships row and the caller did not say
+    which one. `tenant_ids` lets the caller present a picker, same as
+    Core's own login flow does today."""
+
+    def __init__(self, tenant_ids: list[uuid.UUID]) -> None:
+        self.tenant_ids = tenant_ids
+        super().__init__("Multiple tenant memberships; tenant_id is required")
+
+
+async def _resolve_membership_claims(
+    db: AsyncSession, *, user_id: uuid.UUID, requested_tenant_id: uuid.UUID | None,
+) -> dict | None:
+    """Returns the kwargs create_access_token needs for tenant/role/
+    facility claims, or None for a thin (no-tenant) token -- see
+    TenantMembership's own module docstring for everything this
+    deliberately does not replicate from Core's fuller _resolve_claims
+    (multi-role stacking, platform-admin-binds-to-unlisted-tenant,
+    tenant_admin_unscoped_by_default)."""
+    rows = (
+        await db.execute(
+            select(TenantMembership).where(
+                TenantMembership.user_id == user_id, TenantMembership.is_active.is_(True),
+            )
+        )
+    ).scalars().all()
+
+    if requested_tenant_id is not None:
+        membership = next((m for m in rows if m.tenant_id == requested_tenant_id), None)
+        if membership is None:
+            raise AuthenticationError("No active membership for the requested tenant")
+    elif len(rows) == 1:
+        membership = rows[0]
+    elif not rows:
+        return None
+    else:
+        raise TenantSelectionRequiredError([m.tenant_id for m in rows])
+
+    return {
+        "tenant_id": membership.tenant_id, "tenant_slug": membership.tenant_slug,
+        "role": membership.role_name, "archetype": membership.role_archetype,
+        "facility_ids": membership.facility_ids,
+    }
+
+
 async def login(
     db: AsyncSession, *, identifier: str, password: str,
+    tenant_id: uuid.UUID | None = None,
     user_agent: str | None = None, ip_address: str | None = None,
 ) -> tuple[str, str]:
     # `identifier` (email) matches exactly, unchanged -- `username` matches
@@ -62,7 +110,10 @@ async def login(
         logger.info("login.failed", identifier=identifier, reason="inactive")
         raise AuthenticationError("Account is deactivated")
 
-    access_token, _ = create_access_token(user_id=user.id)
+    membership_claims = await _resolve_membership_claims(
+        db, user_id=user.id, requested_tenant_id=tenant_id,
+    )
+    access_token, _ = create_access_token(user_id=user.id, **(membership_claims or {}))
 
     refresh_row = RefreshToken(
         user_id=user.id,
@@ -74,11 +125,13 @@ async def login(
     refresh_token = create_refresh_token(user_id=user.id, token_id=refresh_row.id)
     await db.commit()
 
-    logger.info("login.success", user_id=str(user.id))
+    logger.info("login.success", user_id=str(user.id), tenant_id=str(tenant_id) if tenant_id else None)
     return access_token, refresh_token
 
 
-async def refresh(db: AsyncSession, *, refresh_token: str) -> tuple[str, str]:
+async def refresh(
+    db: AsyncSession, *, refresh_token: str, tenant_id: uuid.UUID | None = None,
+) -> tuple[str, str]:
     try:
         claims = decode_token(refresh_token, expected_type="refresh")
     except InvalidToken as exc:
@@ -119,7 +172,10 @@ async def refresh(db: AsyncSession, *, refresh_token: str) -> tuple[str, str]:
     db.add(new_row)
     await db.flush()
 
-    new_access_token, _ = create_access_token(user_id=row.user_id)
+    membership_claims = await _resolve_membership_claims(
+        db, user_id=row.user_id, requested_tenant_id=tenant_id,
+    )
+    new_access_token, _ = create_access_token(user_id=row.user_id, **(membership_claims or {}))
     new_refresh_token = create_refresh_token(user_id=row.user_id, token_id=new_row.id)
     await db.commit()
 

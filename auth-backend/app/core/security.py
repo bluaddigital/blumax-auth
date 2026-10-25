@@ -59,19 +59,40 @@ TokenType = Literal["access", "refresh", "service"]
 
 
 class TokenClaims:
-    """The human-identity claim set: iss/aud/sub/type/jti/iat/exp, nothing
-    else -- unchanged since Phase 1. `sub` is always a human `users.id`."""
+    """The human-identity claim set: iss/aud/sub/type/jti/iat/exp always
+    present. tid/tsl/rol/arc/fac (2026-10-25, user-approved reversal of the
+    Phase 1 thin-token default) are present only when the caller resolved a
+    real tenant membership (see auth_service.login) -- omitted entirely
+    otherwise, not null, so a refresh/service token (which never has a
+    tenant) stays byte-identical to before this field existed. Same
+    abbreviations as Core's own create_access_token (app/core/security.py
+    there) -- tid=tenant_id, tsl=tenant_slug, rol=role, arc=archetype,
+    fac=facility_ids -- so a service already parsing Core's claim shape
+    (blumax_auth's own TokenVerifier) needs no new code to read these.
+    No pid/prv/adm yet: this service's User model has no person_id/
+    provider_id/is_platform_admin concept (Phase 1 scope) -- left absent,
+    which TokenVerifier._to_context already defaults safely (None/False)."""
 
-    def __init__(self, *, sub: str, token_type: Literal["access", "refresh"], jti: str,
-                 iat: datetime, exp: datetime) -> None:
+    def __init__(
+        self, *, sub: str, token_type: Literal["access", "refresh"], jti: str,
+        iat: datetime, exp: datetime,
+        tenant_id: str | None = None, tenant_slug: str | None = None,
+        role: str | None = None, archetype: str | None = None,
+        facility_ids: list[str] | None = None,
+    ) -> None:
         self.sub = sub
         self.type = token_type
         self.jti = jti
         self.iat = iat
         self.exp = exp
+        self.tenant_id = tenant_id
+        self.tenant_slug = tenant_slug
+        self.role = role
+        self.archetype = archetype
+        self.facility_ids = facility_ids
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "iss": settings.JWT_ISSUER,
             "aud": settings.JWT_AUDIENCE,
             "sub": self.sub,
@@ -80,6 +101,13 @@ class TokenClaims:
             "iat": self.iat,
             "exp": self.exp,
         }
+        if self.tenant_id is not None:
+            out["tid"] = self.tenant_id
+            out["tsl"] = self.tenant_slug
+            out["rol"] = self.role
+            out["arc"] = self.archetype
+            out["fac"] = self.facility_ids
+        return out
 
 
 class ServiceTokenClaims:
@@ -141,13 +169,22 @@ class ServiceTokenClaims:
         }
 
 
-def create_access_token(*, user_id: uuid.UUID) -> tuple[str, str]:
-    """Returns (token, jti). Thin claims only -- see module docstring."""
+def create_access_token(
+    *, user_id: uuid.UUID,
+    tenant_id: uuid.UUID | None = None, tenant_slug: str | None = None,
+    role: str | None = None, archetype: str | None = None,
+    facility_ids: list[uuid.UUID] | None = None,
+) -> tuple[str, str]:
+    """Returns (token, jti). Tenant/role/facility claims are embedded only
+    when `tenant_id` is given -- see TokenClaims' own docstring."""
     now = datetime.now(UTC)
     jti = str(uuid.uuid4())
     claims = TokenClaims(
         sub=str(user_id), token_type="access", jti=jti, iat=now,
         exp=now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
+        tenant_id=str(tenant_id) if tenant_id is not None else None,
+        tenant_slug=tenant_slug, role=role, archetype=archetype,
+        facility_ids=[str(f) for f in facility_ids] if facility_ids is not None else None,
     )
     keys = signing_keys()
     token = jwt.encode(

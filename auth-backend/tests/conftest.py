@@ -13,6 +13,7 @@ from app.core.database import Base, engine
 from app.core.security import hash_password
 from app.main import app
 from app.models.service_account import ServiceAccount
+from app.models.tenant_membership import TenantMembership  # noqa: F401 -- registers metadata
 from app.models.user import User
 
 
