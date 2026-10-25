@@ -102,6 +102,21 @@ def jwks_cache() -> JwksCache:
     return _jwks
 
 
+def verifier() -> TokenVerifier | MultiIssuerTokenVerifier:
+    """The live, fully-configured verifier -- single-issuer or
+    dual-issuer, whichever `configure()` set up. For a service whose own
+    code independently re-verifies a token outside this package's own
+    `require_auth`/`TenantAuth` dependencies (found live 2026-10-25: Labs'
+    own decode_core_token built a brand-new single-issuer TokenVerifier on
+    every call, from settings.JWT_ISSUER/jwks_cache() alone, silently
+    bypassing whatever `also_trust` configure() had actually set up) --
+    call this instead of constructing a new TokenVerifier by hand, so a
+    dual-trust window applies there too."""
+    if _verifier is None:
+        raise RuntimeError("blumax_auth.configure() has not been called")
+    return _verifier
+
+
 def reset() -> None:
     """Drop configuration. Tests only."""
     global _verifier, _jwks

@@ -33,6 +33,7 @@ from blumax_auth.fastapi import (
     require_role,
     require_tenant,
     reset,
+    verifier,
 )
 from blumax_auth.jwks import JwksCache
 from blumax_auth.patient import (
@@ -107,4 +108,5 @@ __all__ = [
     "reset_patients",
     "reset_permissions",
     "reset_session_revocation",
+    "verifier",
 ]
