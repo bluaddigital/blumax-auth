@@ -137,6 +137,19 @@ class Settings(BaseSettings):
     # tokens (Phase 5) for a single internal, platform-fixed caller.
     CORE_USER_SYNC_SERVICE_KEY: str = "dev-blumax-auth-user-sync-key-change-me"
 
+    # Core's own `ISSUE_VIA_BLUMAX_AUTH` migration flag (2026-10-25): once
+    # Core has done ALL of its own login business-rule checks (password,
+    # temp-password expiry, locked account, platform-admin tenant
+    # resolution -- everything this service's own /auth/login does not yet
+    # replicate, by design; see MIGRATION.md), it calls POST /internal/
+    # tokens/mint-for-verified-identity to get a token for that already-
+    # verified identity instead of minting one itself. A DIFFERENT,
+    # dedicated key from CORE_USER_SYNC_SERVICE_KEY above -- that one only
+    # ever lets Core push sync data in; this one lets Core obtain a real,
+    # usable token pair, a materially more sensitive capability, so a leak
+    # or rotation of one is never a leak or rotation of the other.
+    CORE_TOKEN_MINT_SERVICE_KEY: str = "dev-blumax-auth-token-mint-key-change-me"
+
     @property
     def is_production(self) -> bool:
         return self.ENVIRONMENT == "production"

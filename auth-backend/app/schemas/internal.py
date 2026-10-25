@@ -39,3 +39,22 @@ class MembershipSyncRequest(BaseModel):
 class MembershipRevokedRequest(BaseModel):
     user_id: uuid.UUID
     tenant_id: uuid.UUID
+
+
+class MintForVerifiedIdentityRequest(BaseModel):
+    """Core has already run its own login checks (password, temp-password
+    expiry, locked account) for user_id -- this is purely "mint a token for
+    this identity," not a second credential check. tenant_id is optional,
+    same meaning as this service's own /auth/login: omitted auto-binds when
+    exactly one active membership exists, raises (409 at the HTTP layer,
+    not here) when more than one does and none was named."""
+
+    user_id: uuid.UUID
+    tenant_id: uuid.UUID | None = None
+    user_agent: str | None = None
+    ip_address: str | None = None
+
+
+class MintForVerifiedIdentityResponse(BaseModel):
+    access_token: str
+    refresh_token: str

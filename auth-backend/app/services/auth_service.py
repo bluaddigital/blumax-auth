@@ -129,6 +129,62 @@ async def login(
     return access_token, refresh_token
 
 
+async def mint_for_verified_identity(
+    db: AsyncSession, *, user_id: uuid.UUID, tenant_id: uuid.UUID | None = None,
+    user_agent: str | None = None, ip_address: str | None = None,
+) -> tuple[str, str]:
+    """Core's own ISSUE_VIA_BLUMAX_AUTH migration flag (2026-10-25): mint a
+    token pair for an identity CORE has already verified the CREDENTIAL
+    for -- its own password check, temp-password expiry, platform-admin
+    tenant resolution, every login business rule this service's own
+    `login()` above does not yet replicate (see MIGRATION.md). Only the
+    password check is skipped here; is_active is re-checked below, cheap
+    defense-in-depth against this service's own sync lagging Core's by the
+    few seconds between Core's check and this call -- an account
+    deactivated in that window should not mint a token just because Core's
+    read was a moment stale.
+
+    Deliberately a parallel function, not login() with its password
+    argument made optional: a shared function with an "already verified,
+    trust me" flag is one typo away from skipping the credential check
+    too. Duplicating the few-line tail once is cheaper than that risk.
+
+    Raises AuthenticationError if user_id does not exist or is inactive
+    (no token to mint for), or TenantSelectionRequiredError exactly as
+    login() does -- neither can be Core's fault alone to resolve, since
+    Core's own tenant_id resolution and this service's tenant_memberships
+    sync could in principle have drifted; surfacing the same exception
+    either way means the caller (Core) decides how to handle it, not this
+    function.
+    """
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if user is None:
+        raise AuthenticationError("No such user")
+    if not user.is_active:
+        raise AuthenticationError("Account is deactivated")
+
+    membership_claims = await _resolve_membership_claims(
+        db, user_id=user.id, requested_tenant_id=tenant_id,
+    )
+    access_token, _ = create_access_token(user_id=user.id, **(membership_claims or {}))
+
+    refresh_row = RefreshToken(
+        user_id=user.id,
+        expires_at=datetime.now(UTC) + timedelta(days=14),
+        user_agent=user_agent, ip_address=ip_address,
+    )
+    db.add(refresh_row)
+    await db.flush()
+    refresh_token = create_refresh_token(user_id=user.id, token_id=refresh_row.id)
+    await db.commit()
+
+    logger.info(
+        "mint_for_verified_identity.success",
+        user_id=str(user.id), tenant_id=str(tenant_id) if tenant_id else None,
+    )
+    return access_token, refresh_token
+
+
 async def refresh(
     db: AsyncSession, *, refresh_token: str, tenant_id: uuid.UUID | None = None,
 ) -> tuple[str, str]:
