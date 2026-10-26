@@ -29,6 +29,12 @@ from app.models.user import User
 
 logger = structlog.get_logger(__name__)
 
+# Mirrors Core's own blumax-backend/app/modules/identity/application/
+# services.py::_REUSE_GRACE_WINDOW exactly -- same value, same reasoning,
+# no stated need to diverge. See refresh()'s own comment at the one place
+# this is used.
+_REUSE_GRACE_WINDOW = timedelta(seconds=10)
+
 
 class AuthenticationError(Exception):
     pass
@@ -202,8 +208,42 @@ async def refresh(
         raise AuthenticationError("Invalid refresh token")
 
     if row.revoked:
-        # Reuse of an already-rotated-away token: revoke the whole family
-        # for this user, same as Core's own reuse-detection behavior.
+        # A token presented moments after its OWN rotation is not always
+        # theft -- it's also what any OTHER tab/app sharing this session
+        # looks like when it loses a race to rotate the same refresh
+        # token (each tab only single-flights its own refresh calls;
+        # separate tabs/apps have separate JS module instances and don't
+        # know about each other). Core's own AuthService.refresh() hit
+        # this exact bug live and fixed it the same way this does:
+        # distinguish "the losing side of an ordinary race" from real
+        # reuse by checking whether the rotation happened moments ago
+        # AND a legitimately newer session already exists for this user.
+        # A real thief replaying a stolen token has no reason to also
+        # have a newer, live session already active, so this narrows
+        # the exemption to the one case with an innocent explanation --
+        # it does not weaken detection of an actual stolen/replayed
+        # token (see test_replay_with_no_newer_session_still_nukes_the_family).
+        recently_revoked = row.last_used_at is not None and (
+            datetime.now(UTC) - row.last_used_at < _REUSE_GRACE_WINDOW
+        )
+        if recently_revoked:
+            newer_session = await db.execute(
+                select(RefreshToken.id).where(
+                    RefreshToken.user_id == row.user_id,
+                    RefreshToken.revoked.is_(False),
+                    RefreshToken.expires_at > datetime.now(UTC),
+                ).limit(1)
+            )
+            if newer_session.scalar_one_or_none() is not None:
+                logger.info(
+                    "refresh.late_reuse_after_rotation",
+                    user_id=str(row.user_id), jti=str(token_id),
+                )
+                raise AuthenticationError("Invalid refresh token")
+
+        # Reuse of an already-rotated-away token, with no such innocent
+        # explanation: revoke the whole family for this user, same as
+        # Core's own reuse-detection behavior.
         await db.execute(
             RefreshToken.__table__.update()
             .where(RefreshToken.user_id == row.user_id, RefreshToken.revoked.is_(False))

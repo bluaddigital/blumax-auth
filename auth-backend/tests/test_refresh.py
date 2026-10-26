@@ -36,7 +36,17 @@ async def test_expired_refresh_rejected(client: AsyncClient, db_session, test_us
     assert r.status_code == 401
 
 
-async def test_revoked_refresh_rejected_and_detected_as_reuse(client: AsyncClient, db_session, test_user: User):
+async def test_immediate_reuse_with_newer_session_is_refused_but_session_survives(
+    client: AsyncClient, db_session, test_user: User,
+):
+    """Reproduces a real bug found live (2026-10-26): when more than one
+    tab/app shares the same session, each one single-flights its OWN
+    refresh calls but has no idea another tab is also racing to rotate
+    the same refresh token. The losing tab's request lands moments after
+    the winner's, presenting the now-rotated-away token -- not theft,
+    just an ordinary race. Before this fix, that race was read as reuse
+    and nuked every session for the user, including the one that just
+    legitimately won the rotation."""
     login = await client.post(
         "/auth/login", json={"identifier": "alice@example.test", "password": "correct-horse-battery-staple"}
     )
@@ -45,15 +55,48 @@ async def test_revoked_refresh_rejected_and_detected_as_reuse(client: AsyncClien
     first = await client.post("/auth/refresh", json={"refresh_token": old_refresh})
     assert first.status_code == 200
 
-    # Reusing the now-rotated-away token must be rejected...
+    # The losing tab's stale in-flight request, landing moments later.
     second = await client.post("/auth/refresh", json={"refresh_token": old_refresh})
     assert second.status_code == 401
 
-    # ...and must have revoked the entire family, including the token
-    # issued by the first (legitimate) refresh.
+    # The winning tab's session must be completely unaffected -- this is
+    # the actual regression: before the fix, the line above would have
+    # revoked this token too.
     newest_refresh = first.json()["refresh_token"]
     third = await client.post("/auth/refresh", json={"refresh_token": newest_refresh})
-    assert third.status_code == 401
+    assert third.status_code == 200, third.text
+
+
+async def test_replay_with_no_newer_session_still_nukes_the_family(
+    client: AsyncClient, db_session, test_user: User,
+):
+    """The grace window must not weaken real theft detection: a revoked
+    token replayed with no legitimately newer session to explain it away
+    still revokes every session for that user, exactly as before this
+    fix."""
+    login = await client.post(
+        "/auth/login", json={"identifier": "alice@example.test", "password": "correct-horse-battery-staple"}
+    )
+    old_refresh = login.json()["refresh_token"]
+
+    rotated = await client.post("/auth/refresh", json={"refresh_token": old_refresh})
+    assert rotated.status_code == 200
+    rotated_refresh = rotated.json()["refresh_token"]
+
+    # Remove the "a newer session exists" signal the same way Core's own
+    # equivalent test does: log out the rotated session first, so there
+    # is no live session left for the grace window to find.
+    logout = await client.post("/auth/logout", json={"refresh_token": rotated_refresh})
+    assert logout.status_code == 204
+
+    replay = await client.post("/auth/refresh", json={"refresh_token": old_refresh})
+    assert replay.status_code == 401
+
+    # No session survives -- the rotated (now logged-out) one is
+    # confirmed already dead, and reuse-detection must not have spared
+    # anything else either.
+    still_dead = await client.post("/auth/refresh", json={"refresh_token": rotated_refresh})
+    assert still_dead.status_code == 401
 
 
 async def test_rotation_leaves_exactly_one_live_token_per_login(client: AsyncClient, db_session, test_user: User):
