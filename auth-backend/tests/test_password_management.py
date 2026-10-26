@@ -16,6 +16,14 @@ async def _login(client: AsyncClient, password: str = "correct-horse-battery-sta
     return r.json()["access_token"], r.json()["refresh_token"]
 
 
+def _reveal_headers() -> dict[str, str]:
+    """Presents the dev-tooling reveal key (see password_routes.py's
+    _reveal_key_presented) so reset-flow tests can retrieve the code the
+    same way an authorized QA script would, now that the code is no
+    longer echoed to every caller."""
+    return {"X-Dev-Tooling-Reveal-Key": settings.DEV_TOOLING_RESET_CODE_REVEAL_KEY}
+
+
 # ─── Change password ────────────────────────────────────────────────────────
 
 async def test_change_password_valid(client: AsyncClient, test_user: User, db_session: AsyncSession):
@@ -72,9 +80,11 @@ async def test_change_password_revokes_existing_sessions(client: AsyncClient, te
 # ─── Forgot / reset password ────────────────────────────────────────────────
 
 async def test_reset_request_and_confirm(client: AsyncClient, test_user: User, db_session: AsyncSession):
-    r1 = await client.post("/auth/password-reset/request", json={"identifier": "alice@example.test"})
+    r1 = await client.post(
+        "/auth/password-reset/request", json={"identifier": "alice@example.test"}, headers=_reveal_headers(),
+    )
     assert r1.status_code == 202
-    code = r1.json()["dev_reset_code"]  # dev-mode-only convenience, see password_routes.py
+    code = r1.json()["dev_reset_code"]  # only present with the reveal key, see password_routes.py
 
     r2 = await client.post("/auth/password-reset/confirm", json={"reset_code": code, "new_password": "reset-password-123"})
     assert r2.status_code == 204
@@ -87,17 +97,66 @@ async def test_reset_request_for_unknown_identifier_same_response(client: AsyncC
     """Account-enumeration closed: an unknown identifier gets the exact
     same status code and body shape as a real one (modulo the dev-only
     code field being absent)."""
-    r = await client.post("/auth/password-reset/request", json={"identifier": "nobody@example.test"})
+    r = await client.post(
+        "/auth/password-reset/request", json={"identifier": "nobody@example.test"}, headers=_reveal_headers(),
+    )
     assert r.status_code == 202
     assert "dev_reset_code" not in r.json()
     assert r.json()["detail"] == "If the identifier exists, a reset code has been issued."
+
+
+# ─── Reveal-key gate (2026-10-26 fix) ───────────────────────────────────────
+
+async def test_reset_code_not_echoed_without_reveal_key(client: AsyncClient, test_user: User):
+    """The real fix: an unauthenticated caller with no reveal key gets the
+    generic 202 body, never the code, even though this is a 'development'
+    environment with real synced accounts."""
+    r = await client.post("/auth/password-reset/request", json={"identifier": "alice@example.test"})
+    assert r.status_code == 202
+    assert "dev_reset_code" not in r.json()
+    assert r.json()["detail"] == "If the identifier exists, a reset code has been issued."
+
+
+async def test_reset_code_not_echoed_with_wrong_reveal_key(client: AsyncClient, test_user: User):
+    r = await client.post(
+        "/auth/password-reset/request",
+        json={"identifier": "alice@example.test"},
+        headers={"X-Dev-Tooling-Reveal-Key": "not-the-real-key"},
+    )
+    assert r.status_code == 202
+    assert "dev_reset_code" not in r.json()
+
+
+async def test_reset_code_echoed_with_correct_reveal_key(client: AsyncClient, test_user: User):
+    r = await client.post(
+        "/auth/password-reset/request", json={"identifier": "alice@example.test"}, headers=_reveal_headers(),
+    )
+    assert r.status_code == 202
+    assert "dev_reset_code" in r.json()
+
+
+async def test_reset_code_never_echoed_in_production_even_with_reveal_key(client: AsyncClient, test_user: User):
+    """Defense in depth: production never echoes the code to anyone,
+    reveal key or not -- a real transport must exist there instead."""
+    original = settings.ENVIRONMENT
+    settings.ENVIRONMENT = "production"
+    try:
+        r = await client.post(
+            "/auth/password-reset/request", json={"identifier": "alice@example.test"}, headers=_reveal_headers(),
+        )
+        assert r.status_code == 202
+        assert "dev_reset_code" not in r.json()
+    finally:
+        settings.ENVIRONMENT = original
 
 
 async def test_expired_reset_code_rejected(client: AsyncClient, test_user: User):
     original_ttl = settings.PASSWORD_RESET_TTL_SECONDS
     settings.PASSWORD_RESET_TTL_SECONDS = 1
     try:
-        r1 = await client.post("/auth/password-reset/request", json={"identifier": "alice@example.test"})
+        r1 = await client.post(
+            "/auth/password-reset/request", json={"identifier": "alice@example.test"}, headers=_reveal_headers(),
+        )
         code = r1.json()["dev_reset_code"]
         await asyncio.sleep(1.5)
         r2 = await client.post("/auth/password-reset/confirm", json={"reset_code": code, "new_password": "reset-password-123"})
@@ -108,7 +167,9 @@ async def test_expired_reset_code_rejected(client: AsyncClient, test_user: User)
 
 
 async def test_reused_reset_code_rejected(client: AsyncClient, test_user: User):
-    r1 = await client.post("/auth/password-reset/request", json={"identifier": "alice@example.test"})
+    r1 = await client.post(
+        "/auth/password-reset/request", json={"identifier": "alice@example.test"}, headers=_reveal_headers(),
+    )
     code = r1.json()["dev_reset_code"]
     r2 = await client.post("/auth/password-reset/confirm", json={"reset_code": code, "new_password": "reset-password-123"})
     assert r2.status_code == 204
@@ -129,7 +190,9 @@ async def test_reset_for_inactive_account_is_a_noop(client: AsyncClient, test_us
 
 
 async def test_reset_confirm_too_short_password_rejected(client: AsyncClient, test_user: User):
-    r1 = await client.post("/auth/password-reset/request", json={"identifier": "alice@example.test"})
+    r1 = await client.post(
+        "/auth/password-reset/request", json={"identifier": "alice@example.test"}, headers=_reveal_headers(),
+    )
     code = r1.json()["dev_reset_code"]
     r2 = await client.post("/auth/password-reset/confirm", json={"reset_code": code, "new_password": "short"})
     assert r2.status_code == 400

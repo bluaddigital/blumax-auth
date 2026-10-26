@@ -150,6 +150,22 @@ class Settings(BaseSettings):
     # or rotation of one is never a leak or rotation of the other.
     CORE_TOKEN_MINT_SERVICE_KEY: str = "dev-blumax-auth-token-mint-key-change-me"
 
+    # Fixes a real live gap, not a hypothetical (2026-10-26): POST
+    # /auth/password-reset/request echoed the reset code (`dev_reset_code`)
+    # to ANY caller, for ANY identifier, whenever ENVIRONMENT != production
+    # -- no auth on the request, rate-limited by IP only. That was built
+    # when "non-production" meant "no real users," which stopped being
+    # true the moment Core's user-sync relay started mirroring real
+    # hospital staff accounts here. An unauthenticated caller could reset
+    # any real synced account's password and take it over. The echo now
+    # additionally requires this header (X-Dev-Tooling-Reveal-Key) --
+    # still no real SMS/email transport exists (see docs/PHASE5_
+    # BLUMAX_AUTH_CAPABILITY_COMPLETION.md), so this is what lets an
+    # authorized developer/QA script exercise the full reset flow without
+    # one, while a public caller now gets only the generic 202 response,
+    # same as production.
+    DEV_TOOLING_RESET_CODE_REVEAL_KEY: str = "dev-tooling-reset-code-reveal-key-change-me"
+
     @property
     def is_production(self) -> bool:
         return self.ENVIRONMENT == "production"
