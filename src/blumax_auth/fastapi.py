@@ -28,6 +28,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from blumax_auth.context import AuthContext
 from blumax_auth.errors import (
+    ActiveFacilityRequired,
     AuthError,
     Forbidden,
     MissingCredentials,
@@ -162,6 +163,38 @@ async def require_tenant(
     if x_tenant_id is not None and x_tenant_id != ctx.tenant_id:
         raise TenantMismatch()
     return ctx
+
+
+async def require_active_facility(
+    ctx: Annotated[AuthContext, Depends(require_tenant)],
+) -> uuid.UUID:
+    """The facility a NEW record must be stamped with: the session's active facility (token claim "afc").
+
+    Use it on create endpoints. A body `facility_id` can then only be checked against this value, never chosen
+    freely. Raises ActiveFacilityRequired for a token that names no facility (admin portal, service tokens): those
+    callers must state the facility explicitly and have it checked against `may_access_facility`.
+    """
+    if ctx.active_facility_id is None:
+        raise ActiveFacilityRequired()
+    return ctx.active_facility_id
+
+
+def enforce_active_facility(ctx: AuthContext) -> AuthContext:
+    """The REQUIRE_ACTIVE_FACILITY rule, for a service to call from its own dependency when its setting is on.
+
+    A human token that is not bound to a facility is refused when it could otherwise reach more than one facility's
+    data (a grant of several, or none-means-all) and it is not a tenant admin. Allowed unbound: service tokens,
+    platform admins, TENANT_ADMIN (the admin portal works org-wide by design) and a user whose whole grant is a
+    single facility.
+    """
+    if ctx.active_facility_id is not None or ctx.is_service or ctx.is_platform_admin:
+        return ctx
+    if ctx.archetype == "TENANT_ADMIN":
+        return ctx
+    grant = ctx.assigned_facility_ids
+    if grant is not None and len(grant) <= 1:
+        return ctx
+    raise ActiveFacilityRequired()
 
 
 def require_role(*roles: str) -> Callable[..., object]:

@@ -10,6 +10,7 @@ drift looks like before it starts.
 """
 from blumax_auth.context import AuthContext
 from blumax_auth.errors import (
+    ActiveFacilityRequired,
     AuthError,
     Forbidden,
     InvalidToken,
@@ -25,8 +26,10 @@ from blumax_auth.fastapi import (
     TenantAuth,
     TrustAnchor,
     configure,
+    enforce_active_facility,
     install_error_handler,
     jwks_cache,
+    require_active_facility,
     require_archetype,
     require_auth,
     require_platform_admin,
@@ -64,6 +67,7 @@ from blumax_auth.session_revocation import (
 from blumax_auth.verify import MultiIssuerTokenVerifier, TokenVerifier
 
 __all__ = [
+    "ActiveFacilityRequired",
     "Auth",
     "PlatformAdminAuth",
     "AuthContext",
@@ -94,9 +98,11 @@ __all__ = [
     "core_session_checker",
     "configure_permissions",
     "configure_session_revocation",
+    "enforce_active_facility",
     "install_error_handler",
     "jwks_cache",
     "patient_jwks_cache",
+    "require_active_facility",
     "require_auth",
     "require_archetype",
     "require_patient",
