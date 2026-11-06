@@ -135,6 +135,7 @@ dropped — the same note as permissions.py's own docstring.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -155,6 +156,21 @@ _log = logging.getLogger("blumax_auth.session_revocation")
 Mode = Literal["enforce", "warn"]
 FailMode = Literal["open", "closed"]
 FAIL_MODE_ENV = "SESSION_REVOCATION_FAIL_MODE"
+
+# A Redis that accepts the connection and never answers (half-open after a Redis restart / failover /
+# network blip) makes an un-timed `await redis.get()` wait forever, hanging EVERY authenticated request
+# of the service until it is restarted. Every Redis call here is therefore bounded; a timeout is treated
+# exactly like "Redis unavailable" (fail_mode decides), never as a wait.
+TIMEOUT_ENV = "SESSION_REVOCATION_REDIS_TIMEOUT_SECONDS"
+DEFAULT_REDIS_TIMEOUT_SECONDS = 2.0
+
+
+def _redis_timeout() -> float:
+    try:
+        value = float(os.environ.get(TIMEOUT_ENV, "") or DEFAULT_REDIS_TIMEOUT_SECONDS)
+    except ValueError:
+        return DEFAULT_REDIS_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_REDIS_TIMEOUT_SECONDS
 
 
 def _key(user_id: object) -> str:
@@ -200,7 +216,7 @@ class _Checker:
 
         if jti is not None:
             try:
-                if await self.redis.get(_exempt_key(user_id, jti)):
+                if await asyncio.wait_for(self.redis.get(_exempt_key(user_id, jti)), _redis_timeout()):
                     return False, None, None
             except Exception:
                 _log.warning(
@@ -213,7 +229,7 @@ class _Checker:
                 # path this module guarantees.
 
         try:
-            raw = await self.redis.get(_key(user_id))
+            raw = await asyncio.wait_for(self.redis.get(_key(user_id)), _redis_timeout())
         except Exception:
             _log.warning("session_revocation_check_unavailable", extra={"user_id": str(user_id)})
             return False, "redis_unavailable", None
@@ -270,7 +286,12 @@ def configure_session_revocation(
     import redis.asyncio as aioredis  # noqa: PLC0415 — optional dep, only needed if this is used
 
     _checker = _Checker(
-        aioredis.Redis.from_url(redis_url, decode_responses=True), mode=mode, fail_mode=fail_mode
+        aioredis.Redis.from_url(
+            redis_url, decode_responses=True,
+            socket_connect_timeout=_redis_timeout(), socket_timeout=_redis_timeout(),
+            health_check_interval=30,
+        ),
+        mode=mode, fail_mode=fail_mode,
     )
 
 
