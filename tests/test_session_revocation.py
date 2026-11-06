@@ -388,6 +388,57 @@ class TestFailOpen:
         (rec,) = _events(caplog)
         assert rec.decision == "check_failed" and rec.reason == "redis_unavailable"
 
+    async def test_a_redis_that_never_answers_does_not_hang_the_request(
+        self, client, signer, redis, caplog, monkeypatch,
+    ):
+        """Half-open Redis (accepts, never replies): the request must come back within the timeout, not wait forever."""
+        import asyncio
+
+        monkeypatch.setenv("SESSION_REVOCATION_REDIS_TIMEOUT_SECONDS", "0.2")
+
+        async def never(_key):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(redis, "get", never)
+        token = signer.token()
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            r = await asyncio.wait_for(
+                client.get("/checked", headers={"Authorization": f"Bearer {token}"}), timeout=3,
+            )
+        assert r.status_code == 200  # warn mode + fail-open: a stalled Redis is "unavailable", never a stall
+        (rec,) = _events(caplog)
+        assert rec.decision == "check_failed" and rec.reason == "redis_unavailable"
+
+    async def test_a_redis_that_never_answers_fails_closed_in_enforce_closed_mode(
+        self, client, signer, redis, monkeypatch,
+    ):
+        import asyncio
+
+        import blumax_auth.session_revocation as sr
+
+        monkeypatch.setenv("SESSION_REVOCATION_REDIS_TIMEOUT_SECONDS", "0.2")
+
+        async def never(_key):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(redis, "get", never)
+        sr._checker = sr._Checker(redis, mode="enforce", fail_mode="closed")  # type: ignore[arg-type]
+        r = await asyncio.wait_for(
+            client.get("/checked", headers={"Authorization": f"Bearer {signer.token()}"}), timeout=3,
+        )
+        assert r.status_code in (401, 503), r.text
+
+    def test_the_real_client_is_built_with_timeouts_and_health_checks(self, monkeypatch):
+        import blumax_auth.session_revocation as sr
+
+        monkeypatch.delenv("SESSION_REVOCATION_REDIS_TIMEOUT_SECONDS", raising=False)
+        sr._checker = None
+        blumax_auth.configure_session_revocation("redis://127.0.0.1:1/0")
+        kw = sr._checker.redis.connection_pool.connection_kwargs  # type: ignore[union-attr]
+        assert kw["socket_timeout"] == 2.0 and kw["socket_connect_timeout"] == 2.0
+        assert kw["health_check_interval"] == 30
+        blumax_auth.reset_session_revocation()
+
     async def test_a_malformed_marker_is_allowed_and_logged_check_failed(
         self, client, signer, redis, caplog,
     ):
