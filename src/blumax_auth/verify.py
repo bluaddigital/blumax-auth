@@ -164,6 +164,17 @@ def _to_context(claims: dict[str, Any], *, is_service: bool) -> AuthContext:
         except (TypeError, ValueError) as exc:
             raise InvalidToken("Token claim 'fac' is malformed") from exc
 
+    # "afc": the active facility. It must be one the token's own grant covers (a signed token that contradicts itself
+    # is refused), and it NARROWS `facility_ids` to that single facility. `fac` stays available as assigned_facility_ids.
+    assigned_facility_ids = facility_ids
+    active_facility_id = _uuid(claims, "afc")
+    if active_facility_id is not None:
+        if is_service:
+            raise InvalidToken("A service token cannot carry an active facility")
+        if facility_ids is not None and active_facility_id not in facility_ids:
+            raise InvalidToken("Token claim 'afc' is outside the token's facility grant")
+        facility_ids = frozenset({active_facility_id})
+
     return AuthContext(
         user_id=user_id,
         tenant_id=_uuid(claims, "tid"),
@@ -177,4 +188,6 @@ def _to_context(claims: dict[str, Any], *, is_service: bool) -> AuthContext:
         jti=claims.get("jti"),
         is_service=is_service,
         issued_at=_issued_at(claims),
+        active_facility_id=active_facility_id,
+        assigned_facility_ids=assigned_facility_ids,
     )

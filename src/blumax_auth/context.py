@@ -61,6 +61,18 @@ class AuthContext:
     # AccessTokenClaims.issued_at (app/core/security.py) exactly, so both
     # sides decode "iat" the identical way.
     issued_at: datetime | None = None
+    # The ONE facility the session works in (the token's "afc"), or None for a token that names none (admin portal,
+    # direct API use, service tokens). When set, `facility_ids` is narrowed to {active_facility_id}, so every guard
+    # that already reads `facility_ids` / `may_access_facility` enforces the single facility with no per-route change.
+    active_facility_id: uuid.UUID | None = None
+    # The full grant the token carried in "fac" before it was narrowed (None = unrestricted). Only for code that must
+    # know what the user MAY switch to; never use it to authorize data access.
+    assigned_facility_ids: frozenset[uuid.UUID] | None = None
+
+    @property
+    def is_facility_bound(self) -> bool:
+        """True when the token names the one facility the session works in."""
+        return self.active_facility_id is not None
 
     def may_access_facility(self, facility_id: uuid.UUID) -> bool:
         """Whether this caller's scope covers a facility.

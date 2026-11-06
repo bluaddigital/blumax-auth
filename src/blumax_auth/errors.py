@@ -62,6 +62,18 @@ class Forbidden(AuthError):
     message = "You do not have permission to perform this action"
 
 
+class ActiveFacilityRequired(AuthError):
+    """The route works inside exactly one facility and the token does not name one.
+
+    403 with its own code so a client can tell it apart from a plain permission failure: the fix is to choose a
+    facility (the login picker / app switcher), not to ask for a role.
+    """
+
+    status_code = 403
+    error_code = "ACTIVE_FACILITY_REQUIRED"
+    message = "Choose the facility you are working in"
+
+
 class PatientSessionInactive(AuthError):
     """A validly signed patient token whose session has been revoked or expired."""
 
