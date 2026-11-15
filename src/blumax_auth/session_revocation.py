@@ -139,6 +139,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Literal
 
@@ -163,6 +164,29 @@ FAIL_MODE_ENV = "SESSION_REVOCATION_FAIL_MODE"
 # exactly like "Redis unavailable" (fail_mode decides), never as a wait.
 TIMEOUT_ENV = "SESSION_REVOCATION_REDIS_TIMEOUT_SECONDS"
 DEFAULT_REDIS_TIMEOUT_SECONDS = 2.0
+
+
+# After a Redis failure the next requests skip Redis for this long and apply fail_mode at once. A Redis that hangs
+# (failover, half-open connection) used to cost every authenticated request two full timeouts (~4 s at the default),
+# for as long as it hung; now one request per window pays one timeout. 0 turns the breaker off.
+BREAKER_ENV = "SESSION_REVOCATION_BREAKER_SECONDS"
+DEFAULT_BREAKER_SECONDS = 10.0
+#: The reason given while the breaker is open: treated exactly like "redis_unavailable" (fail_mode decides), but the
+#: alerting `redis_unavailable` warning was already logged by the failure that opened the window.
+REASON_SKIPPED = "redis_unavailable_skipped"
+
+
+def _clock() -> float:
+    """The breaker's clock (its own name, so a test can move it without stopping the event loop's timers)."""
+    return time.monotonic()
+
+
+def _breaker_seconds() -> float:
+    try:
+        value = float(os.environ.get(BREAKER_ENV, "") or DEFAULT_BREAKER_SECONDS)
+    except ValueError:
+        return DEFAULT_BREAKER_SECONDS
+    return max(value, 0.0)
 
 
 def _redis_timeout() -> float:
@@ -196,6 +220,8 @@ class _Checker:
         self.redis = redis
         self.mode = mode
         self.fail_mode = fail_mode
+        #: monotonic time until which Redis is not asked (the breaker; see BREAKER_ENV).
+        self._skip_until = 0.0
 
     async def is_revoked(
         self, user_id: object, issued_at: datetime | None, jti: str | None
@@ -213,26 +239,26 @@ class _Checker:
         """
         if issued_at is None:
             return False, "no_issued_at", None
+        if _clock() < self._skip_until:
+            return False, REASON_SKIPPED, None
 
-        if jti is not None:
-            try:
-                if await asyncio.wait_for(self.redis.get(_exempt_key(user_id, jti)), _redis_timeout()):
-                    return False, None, None
-            except Exception:
-                _log.warning(
-                    "session_revocation_exemption_check_unavailable",
-                    extra={"user_id": str(user_id)},
-                )
-                # Fall through to the ordinary marker check below rather than
-                # returning early — a broken Redis client will fail that
-                # check too and fail open there, the one shared fail-open
-                # path this module guarantees.
-
+        # The exemption key and the marker in ONE round trip (MGET), bounded by one timeout. A client without mget
+        # (a test double) is asked key by key; the first failure ends the check either way, so a hung Redis costs
+        # one timeout per request, never two.
+        keys = [_exempt_key(user_id, jti), _key(user_id)] if jti is not None else [_key(user_id)]
         try:
-            raw = await asyncio.wait_for(self.redis.get(_key(user_id)), _redis_timeout())
+            mget = getattr(self.redis, "mget", None)
+            if mget is not None:
+                values = await asyncio.wait_for(mget(keys), _redis_timeout())
+            else:
+                values = [await asyncio.wait_for(self.redis.get(k), _redis_timeout()) for k in keys]
         except Exception:
+            self._skip_until = _clock() + _breaker_seconds()
             _log.warning("session_revocation_check_unavailable", extra={"user_id": str(user_id)})
             return False, "redis_unavailable", None
+        if jti is not None and values[0]:
+            return False, None, None
+        raw = values[-1]
         if not raw:
             return False, None, None
         try:
@@ -347,8 +373,8 @@ async def check_session_revocation(
     revoked, reason, revoked_at = await checker.is_revoked(ctx.user_id, ctx.issued_at, ctx.jti)
 
     if reason is not None:
-        failed = reason in ("redis_unavailable", "marker_malformed")
-        if failed:
+        failed = reason in ("redis_unavailable", REASON_SKIPPED, "marker_malformed")
+        if failed and reason != REASON_SKIPPED:
             # Always visible, in either mode and either fail_mode, so the
             # degradation can be alerted on (see "Redis-failure policy").
             _log.warning(
