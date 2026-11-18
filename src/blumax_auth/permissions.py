@@ -147,6 +147,8 @@ class _Checker:
         max_entries: int,
         transport: httpx.AsyncBaseTransport | None,
         clock: Callable[[], float],
+        breaker_failures: int = 0,
+        breaker_open_seconds: float = 10.0,
     ) -> None:
         self._core_url = core_url.rstrip("/")
         self._ttl = ttl_seconds
@@ -155,6 +157,13 @@ class _Checker:
         self._transport = transport
         self._clock = clock
         self._client: httpx.AsyncClient | None = None
+        # Circuit breaker (APP-007): after `breaker_failures` consecutive "Core is unwell" outcomes (unreachable, timeout, 5xx, malformed) further
+        # lookups are refused at once, with the same PermissionCheckUnavailable (503, fail-closed, never a grant), until `breaker_open_seconds`
+        # pass; then one probe goes through. 0 disables the breaker. A 401/403/404 means Core ANSWERED: it counts as reachable.
+        self._breaker_limit = breaker_failures
+        self._breaker_open_seconds = breaker_open_seconds
+        self._breaker_failures = 0
+        self._breaker_open_until = 0.0
         # Insertion order == expiry order (one constant TTL), so expired entries
         # are always at the front and eviction is a cheap popitem.
         self._cache: OrderedDict[_CacheKey, tuple[float, frozenset[str]]] = OrderedDict()
@@ -225,14 +234,36 @@ class _Checker:
         if self._client is None:
             self._client = httpx.AsyncClient(
                 base_url=self._core_url, timeout=self._timeout, transport=self._transport,
+                # APP-006: httpx keeps an idle connection for 5 s and uvicorn (Core) closes an idle one after 5 s, so a request could reuse a
+                # connection in the instant the server closes it and fail with a reset. Expire ours first.
+                limits=httpx.Limits(keepalive_expiry=3.0),
             )
         return self._client
+
+    def _breaker_is_open(self) -> bool:
+        return self._breaker_limit > 0 and self._breaker_failures >= self._breaker_limit and self._clock() < self._breaker_open_until
+
+    def _breaker_record(self, outage: bool) -> None:
+        if self._breaker_limit <= 0:
+            return
+        if not outage:
+            self._breaker_failures = 0
+            self._breaker_open_until = 0.0
+            return
+        self._breaker_failures += 1
+        if self._breaker_failures >= self._breaker_limit:
+            if self._clock() >= self._breaker_open_until:
+                _log.warning("permission_check_breaker_open", extra={"failures": self._breaker_failures})
+            self._breaker_open_until = self._clock() + self._breaker_open_seconds  # also reopens at once when a half-open probe fails
 
     async def _fetch(self, key: _CacheKey, tenant_id: uuid.UUID, token: str) -> _Fetched:
         started = time.perf_counter()
 
         def _elapsed() -> float:
             return round((time.perf_counter() - started) * 1000, 1)
+
+        if self._breaker_is_open():
+            raise _annotated(PermissionCheckUnavailable(), None, 0.0)
 
         try:
             resp = await self._http().get(
@@ -248,9 +279,14 @@ class _Checker:
             )
         except httpx.HTTPError as exc:
             _log.warning("permission_check_core_unreachable", extra={"error": type(exc).__name__})
+            self._breaker_record(outage=True)
             raise _annotated(PermissionCheckUnavailable(), None, _elapsed()) from exc
 
         latency = _elapsed()
+        if resp.status_code in (401, 403, 404):
+            self._breaker_record(outage=False)  # Core answered: it is reachable
+        elif resp.status_code != 200:
+            self._breaker_record(outage=True)
         if resp.status_code == 401:
             # Verified locally but refused by Core (revoked session, key rotation
             # not yet seen here). Refuse — never fall through to "allowed".
@@ -265,11 +301,14 @@ class _Checker:
             permissions = resp.json()["permissions"]
         except (ValueError, KeyError, TypeError) as exc:
             _log.warning("permission_check_core_malformed")
+            self._breaker_record(outage=True)
             raise _annotated(PermissionCheckUnavailable(), resp.status_code, latency) from exc
         if not isinstance(permissions, list) or not all(isinstance(c, str) for c in permissions):
             _log.warning("permission_check_core_malformed")
+            self._breaker_record(outage=True)
             raise _annotated(PermissionCheckUnavailable(), resp.status_code, latency)
 
+        self._breaker_record(outage=False)
         codes = frozenset(permissions)
         self._store(key, codes)
         return _Fetched(codes=codes, latency_ms=latency)
@@ -293,6 +332,8 @@ def configure_permissions(
     max_entries: int = 10_000,
     transport: httpx.AsyncBaseTransport | None = None,
     clock: Callable[[], float] = time.monotonic,
+    breaker_failures: int = 5,
+    breaker_open_seconds: float = 10.0,
 ) -> None:
     """Point this service at Core for permission checks. Call once, at startup.
 
@@ -302,6 +343,9 @@ def configure_permissions(
                     fails closed.
     max_entries     Upper bound on cached callers; the oldest are dropped first.
     transport/clock Test seams (an httpx transport, a monotonic clock).
+    breaker_failures  Consecutive Core failures (unreachable, timeout, 5xx, malformed) after which lookups are refused at once, fail-closed, for
+                      `breaker_open_seconds`, instead of each waiting out the timeout (APP-007). 0 disables the breaker. A refusal is the same
+                      PermissionCheckUnavailable (503) as an unanswered check: never a grant, never cached.
     """
     global _checker
     if not core_url or not core_url.strip():
@@ -312,6 +356,8 @@ def configure_permissions(
         raise ValueError("timeout_seconds must be > 0")
     if max_entries < 1:
         raise ValueError("max_entries must be >= 1")
+    if breaker_failures < 0 or breaker_open_seconds <= 0:
+        raise ValueError("breaker_failures must be >= 0 and breaker_open_seconds > 0")
     _checker = _Checker(
         core_url=core_url,
         ttl_seconds=ttl_seconds,
@@ -319,6 +365,8 @@ def configure_permissions(
         max_entries=max_entries,
         transport=transport,
         clock=clock,
+        breaker_failures=breaker_failures,
+        breaker_open_seconds=breaker_open_seconds,
     )
 
 
