@@ -76,6 +76,37 @@ The events are emitted through the stdlib logger `blumax_auth.permissions` with 
 fields as `extra`. A service that renders logs through structlog must include
 `structlog.stdlib.ExtraAdder()` in its ProcessorFormatter's foreign_pre_chain, or
 the fields are silently dropped.
+
+Riding out a Core outage (containment layers C1-C4)
+---------------------------------------------------
+C1  Single-flight + per-caller cache of successful answers (above).
+C2  Circuit breaker: after `breaker_failures` consecutive "Core is unwell" outcomes
+    (no answer, 5xx, malformed) lookups are refused at once for
+    `breaker_open_seconds`, then one probe goes through. Same 503, never a grant.
+    Default 5 / 10 s; `breaker_failures=0` turns it off.
+C3  One retry on NO answer (`retry_on_no_answer`, default on): when the ask timed
+    out or could not connect, it is asked once more after `retry_pause_seconds`
+    (0.15 s). Never when Core answered — a 401, 403, 404, 5xx or malformed body is
+    the outcome as it stands — and never while the breaker is open. The retry runs
+    inside the single-flight fetch, so concurrent waiters share it. It is a read
+    (GET /api/v1/me/permissions): it cannot duplicate a write and does not change
+    the decision, only whether one is reached. Each failed attempt counts towards
+    the breaker. Worst case for one check: 2 x timeout + pause.
+C4  Bounded stale-on-error (`stale_grace_seconds`, default 0 = OFF, capped at 120):
+    when the lookup still fails with no answer, a 5xx or an open breaker, and this
+    process holds Core's last SUCCESSFUL answer for the same tenant + user +
+    sha256(token) whose TTL ran out less than the grace ago, that answer is used
+    (allow or deny, exactly as Core gave it). Every stale serve is logged
+    (`permission_check_served_stale`, WARNING) and counted. Never: for a caller with
+    no earlier success in this process; after Core answered 401/403/404 for that key
+    (the held answer is dropped); on a malformed answer; on a route marked
+    `admin=True` (require_permission / check_permission). Session revocation and
+    token expiry are checked upstream in require_tenant() and still apply. While on,
+    a grant Core withdrew in the last TTL + grace seconds is still honoured during an
+    outage: enabling it is an owner decision per service (OD-DEP-1).
+
+Counters (optional): `blumax_core_permission_calls_total{outcome}` when the process
+has BLUMAX_METRICS_ENABLED=true and prometheus_client installed; see metrics.py.
 """
 from __future__ import annotations
 
@@ -96,11 +127,15 @@ from fastapi.security import HTTPAuthorizationCredentials
 from blumax_auth.context import AuthContext
 from blumax_auth.errors import AuthError, Forbidden, InvalidToken, MissingCredentials
 from blumax_auth.fastapi import _bearer, require_tenant
+from blumax_auth.metrics import core_permission_call as _count
 
 _log = logging.getLogger("blumax_auth.permissions")
 
 #: Core's endpoint for "what does this caller hold?".
 PERMISSIONS_PATH = "/api/v1/me/permissions"
+
+#: Hard upper bound for C4's grace (a larger configured value is clamped to it).
+MAX_STALE_GRACE_SECONDS = 120.0
 
 Mode = Literal["enforce", "warn"]
 _CacheKey = tuple[uuid.UUID, uuid.UUID, str]
@@ -149,6 +184,9 @@ class _Checker:
         clock: Callable[[], float],
         breaker_failures: int = 0,
         breaker_open_seconds: float = 10.0,
+        retry_on_no_answer: bool = False,
+        retry_pause_seconds: float = 0.15,
+        stale_grace_seconds: float = 0.0,
     ) -> None:
         self._core_url = core_url.rstrip("/")
         self._ttl = ttl_seconds
@@ -164,6 +202,12 @@ class _Checker:
         self._breaker_open_seconds = breaker_open_seconds
         self._breaker_failures = 0
         self._breaker_open_until = 0.0
+        # C3: one more ask when the first got no answer at all.
+        self._retry = retry_on_no_answer
+        self._retry_pause = retry_pause_seconds
+        # C4: the last successful answer per caller key, kept `grace` past its TTL. Same key and same insertion==expiry order as the cache.
+        self._grace = min(max(0.0, stale_grace_seconds), MAX_STALE_GRACE_SECONDS)
+        self._last_good: OrderedDict[_CacheKey, tuple[float, frozenset[str]]] = OrderedDict()
         # Insertion order == expiry order (one constant TTL), so expired entries
         # are always at the front and eviction is a cheap popitem.
         self._cache: OrderedDict[_CacheKey, tuple[float, frozenset[str]]] = OrderedDict()
@@ -171,8 +215,11 @@ class _Checker:
 
     # ── public ────────────────────────────────────────────────────────────────
 
-    async def granted(self, ctx: AuthContext, token: str) -> _Answer:
-        """The codes Core says this caller holds in the token's tenant."""
+    async def granted(self, ctx: AuthContext, token: str, *, allow_stale: bool = True) -> _Answer:
+        """The codes Core says this caller holds in the token's tenant.
+
+        allow_stale=False (routes marked admin) never takes C4's stale answer.
+        """
         assert ctx.tenant_id is not None  # require_tenant() guarantees it
         key: _CacheKey = (ctx.tenant_id, ctx.user_id, hashlib.sha256(token.encode()).hexdigest())
 
@@ -189,7 +236,23 @@ class _Checker:
             task = asyncio.ensure_future(self._fetch(key, ctx.tenant_id, token))
             self._inflight[key] = task
             task.add_done_callback(lambda t, k=key: self._settled(k, t))
-        fetched = await asyncio.shield(task)
+        try:
+            fetched = await asyncio.shield(task)
+        except PermissionCheckUnavailable as exc:
+            stale = self._stale(key, exc) if allow_stale else None
+            if stale is None:
+                raise
+            expires_at, codes = stale
+            _log.warning(
+                "permission_check_served_stale",
+                extra={
+                    "tenant_id": str(ctx.tenant_id), "user_id": str(ctx.user_id),
+                    "seconds_past_expiry": round(max(0.0, self._clock() - expires_at), 1),
+                    "core_status": getattr(exc, "core_status", None),
+                },
+            )
+            _count("stale_served")
+            return _Answer(codes=codes, cached=True)
         return _Answer(codes=fetched.codes, cached=False, latency_ms=fetched.latency_ms)
 
     async def aclose(self) -> None:
@@ -199,6 +262,7 @@ class _Checker:
 
     def clear(self) -> None:
         self._cache.clear()
+        self._last_good.clear()
 
     # ── cache ─────────────────────────────────────────────────────────────────
 
@@ -221,6 +285,31 @@ class _Checker:
             self._cache.popitem(last=False)
         while len(self._cache) > self._max:
             self._cache.popitem(last=False)
+        if self._grace > 0:
+            self._last_good[key] = (now + self._ttl, codes)
+            self._last_good.move_to_end(key)
+            while self._last_good and next(iter(self._last_good.values()))[0] + self._grace <= now:
+                self._last_good.popitem(last=False)
+            while len(self._last_good) > self._max:
+                self._last_good.popitem(last=False)
+
+    def _forget(self, key: _CacheKey) -> None:
+        """Core ANSWERED that this caller key is refused (401/403/404): never serve its old answer stale."""
+        self._last_good.pop(key, None)
+
+    def _stale(self, key: _CacheKey, exc: PermissionCheckUnavailable) -> tuple[float, frozenset[str]] | None:
+        """C4: the held answer for `key` if this failure qualifies and it is inside the grace; else None."""
+        if self._grace <= 0:
+            return None
+        status = getattr(exc, "core_status", None)
+        if status is not None and status < 500:  # a malformed 200: Core answered nonsense, not "nothing"
+            return None
+        entry = self._last_good.get(key)
+        if entry is None:
+            return None
+        if self._clock() >= entry[0] + self._grace:
+            return None
+        return entry
 
     def _settled(self, key: _CacheKey, task: asyncio.Task[_Fetched]) -> None:
         if self._inflight.get(key) is task:
@@ -257,12 +346,25 @@ class _Checker:
             self._breaker_open_until = self._clock() + self._breaker_open_seconds  # also reopens at once when a half-open probe fails
 
     async def _fetch(self, key: _CacheKey, tenant_id: uuid.UUID, token: str) -> _Fetched:
+        """One lookup, plus C3's single retry when the first ask got no answer at all."""
+        try:
+            return await self._ask(key, tenant_id, token)
+        except PermissionCheckUnavailable as exc:
+            if not (self._retry and getattr(exc, "no_answer", False)) or self._breaker_is_open():
+                raise
+        _log.info("permission_check_retry", extra={"tenant_id": str(tenant_id)})
+        _count("retried")
+        await asyncio.sleep(self._retry_pause)
+        return await self._ask(key, tenant_id, token)  # whatever this one gives (answer or failure) is the outcome
+
+    async def _ask(self, key: _CacheKey, tenant_id: uuid.UUID, token: str) -> _Fetched:
         started = time.perf_counter()
 
         def _elapsed() -> float:
             return round((time.perf_counter() - started) * 1000, 1)
 
         if self._breaker_is_open():
+            _count("breaker_open")
             raise _annotated(PermissionCheckUnavailable(), None, 0.0)
 
         try:
@@ -279,36 +381,46 @@ class _Checker:
             )
         except httpx.HTTPError as exc:
             _log.warning("permission_check_core_unreachable", extra={"error": type(exc).__name__})
+            _count("timeout" if isinstance(exc, httpx.TimeoutException) else "unreachable")
             self._breaker_record(outage=True)
-            raise _annotated(PermissionCheckUnavailable(), None, _elapsed()) from exc
+            failure = _annotated(PermissionCheckUnavailable(), None, _elapsed())
+            failure.no_answer = True  # type: ignore[attr-defined]  # C3 may ask again; an answer never sets this
+            raise failure from exc
 
         latency = _elapsed()
         if resp.status_code in (401, 403, 404):
             self._breaker_record(outage=False)  # Core answered: it is reachable
+            self._forget(key)                   # and refused this caller: no stale answer for it from now on
         elif resp.status_code != 200:
             self._breaker_record(outage=True)
         if resp.status_code == 401:
             # Verified locally but refused by Core (revoked session, key rotation
             # not yet seen here). Refuse — never fall through to "allowed".
+            _count("unauthorized")
             raise _annotated(InvalidToken(), 401, latency)
         if resp.status_code in (403, 404):
+            _count("forbidden")
             raise _annotated(Forbidden("The caller has no access to this tenant"), resp.status_code, latency)
         if resp.status_code != 200:
             _log.warning("permission_check_core_status", extra={"status": resp.status_code})
+            _count("server_error")
             raise _annotated(PermissionCheckUnavailable(), resp.status_code, latency)
 
         try:
             permissions = resp.json()["permissions"]
         except (ValueError, KeyError, TypeError) as exc:
             _log.warning("permission_check_core_malformed")
+            _count("malformed")
             self._breaker_record(outage=True)
             raise _annotated(PermissionCheckUnavailable(), resp.status_code, latency) from exc
         if not isinstance(permissions, list) or not all(isinstance(c, str) for c in permissions):
             _log.warning("permission_check_core_malformed")
+            _count("malformed")
             self._breaker_record(outage=True)
             raise _annotated(PermissionCheckUnavailable(), resp.status_code, latency)
 
         self._breaker_record(outage=False)
+        _count("ok")
         codes = frozenset(permissions)
         self._store(key, codes)
         return _Fetched(codes=codes, latency_ms=latency)
@@ -334,6 +446,9 @@ def configure_permissions(
     clock: Callable[[], float] = time.monotonic,
     breaker_failures: int = 5,
     breaker_open_seconds: float = 10.0,
+    retry_on_no_answer: bool = True,
+    retry_pause_seconds: float = 0.15,
+    stale_grace_seconds: float = 0.0,
 ) -> None:
     """Point this service at Core for permission checks. Call once, at startup.
 
@@ -346,6 +461,12 @@ def configure_permissions(
     breaker_failures  Consecutive Core failures (unreachable, timeout, 5xx, malformed) after which lookups are refused at once, fail-closed, for
                       `breaker_open_seconds`, instead of each waiting out the timeout (APP-007). 0 disables the breaker. A refusal is the same
                       PermissionCheckUnavailable (503) as an unanswered check: never a grant, never cached.
+    retry_on_no_answer  C3: ask Core once more, after `retry_pause_seconds`, when the first ask got NO answer (timeout / connection
+                        error). Never on an answer (401/403/404/5xx/malformed), never while the breaker is open. Default on; False = off.
+    stale_grace_seconds C4: during an outage (no answer, 5xx, breaker open) reuse this process's last successful answer for the same
+                        caller key for up to this many seconds past its TTL. 0 (default) = off. Capped at MAX_STALE_GRACE_SECONDS (120);
+                        a larger value is clamped with a warning. Needs ttl_seconds > 0. Never on routes marked admin=True.
+                        Services read it from PERMISSION_CHECK_STALE_GRACE_SECONDS; enabling it is an owner decision (OD-DEP-1).
     """
     global _checker
     if not core_url or not core_url.strip():
@@ -358,6 +479,15 @@ def configure_permissions(
         raise ValueError("max_entries must be >= 1")
     if breaker_failures < 0 or breaker_open_seconds <= 0:
         raise ValueError("breaker_failures must be >= 0 and breaker_open_seconds > 0")
+    if retry_pause_seconds < 0:
+        raise ValueError("retry_pause_seconds must be >= 0")
+    if stale_grace_seconds < 0:
+        raise ValueError("stale_grace_seconds must be >= 0")
+    if stale_grace_seconds > MAX_STALE_GRACE_SECONDS:
+        _log.warning(
+            "permission_stale_grace_clamped",
+            extra={"configured": stale_grace_seconds, "max": MAX_STALE_GRACE_SECONDS},
+        )
     _checker = _Checker(
         core_url=core_url,
         ttl_seconds=ttl_seconds,
@@ -367,6 +497,9 @@ def configure_permissions(
         clock=clock,
         breaker_failures=breaker_failures,
         breaker_open_seconds=breaker_open_seconds,
+        retry_on_no_answer=retry_on_no_answer,
+        retry_pause_seconds=retry_pause_seconds,
+        stale_grace_seconds=stale_grace_seconds,
     )
 
 
@@ -382,7 +515,7 @@ def reset_permissions() -> None:
     _checker = None
 
 
-def require_permission(code: str, *, mode: Mode = "enforce") -> Callable[..., object]:
+def require_permission(code: str, *, mode: Mode = "enforce", admin: bool = False) -> Callable[..., object]:
     """Restrict a route to callers whose role holds exactly this permission code.
 
     One code, deliberately: a route has one deterministic permission. Returns the
@@ -393,6 +526,8 @@ def require_permission(code: str, *, mode: Mode = "enforce") -> Callable[..., ob
     Core rejects (401/403), or when Core cannot answer (503).
     mode="warn" performs the same check and refuses nothing; see the module
     docstring.
+    admin=True marks an administrative / role-management / break-glass route: it is
+    never answered from C4's stale-on-error cache, whatever stale_grace_seconds says.
     """
     if not isinstance(code, str) or not code or any(ch.isspace() for ch in code):
         raise ValueError(f"permission code must be a non-empty string without spaces, got {code!r}")
@@ -419,7 +554,7 @@ def require_permission(code: str, *, mode: Mode = "enforce") -> Callable[..., ob
             raise RuntimeError("blumax_auth.configure_permissions() has not been called")
 
         try:
-            answer = await checker.granted(ctx, credentials.credentials)
+            answer = await _granted(checker, ctx, credentials.credentials, admin=admin)
         except AuthError as exc:
             if mode == "warn":
                 _emit(
@@ -455,7 +590,7 @@ def require_permission(code: str, *, mode: Mode = "enforce") -> Callable[..., ob
     return _check
 
 
-async def check_permission(ctx: AuthContext, token: str, code: str) -> bool:
+async def check_permission(ctx: AuthContext, token: str, code: str, *, admin: bool = False) -> bool:
     """Whether `ctx`'s role holds `code`, per Core — for a check that can't be
     expressed as a route-level `require_permission()` dependency because
     whether it applies at all depends on something only known once the
@@ -473,14 +608,24 @@ async def check_permission(ctx: AuthContext, token: str, code: str) -> bool:
     response, `configure_permissions()` never called) — a caller that wants
     warn-mode semantics (log and allow) should catch `AuthError` itself, the
     same way `require_permission(mode="warn")` does internally.
+
+    admin=True: never answered from the stale-on-error cache (see require_permission).
     """
     if ctx.is_platform_admin:
         return True
     checker = _checker
     if checker is None:
         raise RuntimeError("blumax_auth.configure_permissions() has not been called")
-    answer = await checker.granted(ctx, token)
+    answer = await _granted(checker, ctx, token, admin=admin)
     return code in answer.codes
+
+
+async def _granted(checker: _Checker, ctx: AuthContext, token: str, *, admin: bool) -> _Answer:
+    # The keyword is passed only when it matters, so a service that still wraps `granted(ctx, token)` (IPD's / OPD's
+    # app/core/permission_resilience.py, written against 0.5.1) keeps working unchanged on 0.5.2 for non-admin routes.
+    if admin:
+        return await checker.granted(ctx, token, allow_stale=False)
+    return await checker.granted(ctx, token)
 
 
 def _reason_for(exc: AuthError) -> str:
