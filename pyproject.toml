@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "blumax-auth"
-version = "0.5.1"
+version = "0.5.2"
 description = "Verify BluMax Core-issued JWTs. Verification only — never issuance."
 requires-python = ">=3.12"
 dependencies = [
@@ -20,12 +20,18 @@ dependencies = [
 session-revocation = [
     "redis>=5.0",
 ]
+# prometheus_client is only imported when BLUMAX_METRICS_ENABLED=true (see metrics.py);
+# a service without it keeps working, the counter is just not exposed.
+metrics = [
+    "prometheus-client>=0.20",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "cryptography>=42",
     "fastapi>=0.115",
     "redis>=5.0",
+    "prometheus-client>=0.20",
     "ruff>=0.6",
 ]
 
