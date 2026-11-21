@@ -352,7 +352,7 @@ class TestCoreUnavailable:
         core.fail = httpx.ConnectError("down")
         assert (await client.get("/consult", headers=h)).status_code == 503
         assert (await client.get("/consult", headers=h)).status_code == 503
-        assert core.calls == 2                                   # each one asked again
+        assert core.calls == 4                                   # each one asked again (and retried once: no answer, C3)
         core.fail = None                                         # Core comes back
         assert (await client.get("/consult", headers=h)).status_code == 200
 
@@ -371,7 +371,7 @@ class TestCoreUnavailable:
         core.delay = 0.05
         results = await asyncio.gather(*[client.get("/consult", headers=h) for _ in range(20)])
         assert {r.status_code for r in results} == {503}
-        assert core.calls == 1
+        assert core.calls == 2                                   # one ask + ONE shared retry (C3), not one per request
 
 
 # ─── 6. Tenant context cannot be substituted by the caller ────────────────────
