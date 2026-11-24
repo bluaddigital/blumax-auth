@@ -30,12 +30,18 @@ The answer is usable only when ALL of these hold (checked in this order; the fir
      Bounded staleness when the answer IS used: an authorization write is seen at the latest after the cache window
      (authz_ver_cache_seconds, default 2 s, clamped to 5 s).
   5. the catalogue (Core GET /api/v1/authz/catalogue: version + ordered {idx, code, status}) is held at a version
-     >= the token's cv. Fetched lazily on first need, with the caller's own token (Core accepts any authenticated
-     staff or service token), cached per version, re-fetched when a token names a newer cv. One fetch at a time per
-     process (single-flight); a failed fetch is not retried for `catalogue_retry_seconds` (10 s), a fetch that
-     returned an older version than wanted not for 5 s.
-       fetch failed / malformed                                              catalogue_unavailable
-       still older than the token's cv after a refetch                       catalogue_behind
+     >= the token's cv. It is PRELOADED in the background: the first staff v2 token this process sees (or the first
+     naming a newer cv) starts ONE fetch, with that caller's own token (Core accepts any authenticated staff or service
+     token; there is no token to fetch with before the first request), and NO request ever waits for it -- requests
+     fall back until it has landed. The preload is started before the freshness check, so a stale / unset authz_ver
+     does not keep the catalogue from loading. Cached per version. One fetch at a time per process (single-flight); a
+     failed fetch is not retried for `catalogue_retry_seconds` (10 s), a fetch that returned an older version than
+     wanted not for 5 s. Its own timeout: `catalogue_timeout_seconds` (env PERMISSION_CATALOGUE_TIMEOUT_SECONDS,
+     default 10, capped at 30) -- independent of the permission-check timeout, because the catalogue is a one-off
+     ~30 KB read that a busy Core can take seconds to serve.
+       no catalogue yet, the preload is in flight                            catalogue_loading
+       no catalogue: the fetch failed / was malformed (backing off)          catalogue_unavailable
+       held catalogue older than the token's cv (refetch in the background)  catalogue_behind
   6. the bitset decodes (base64url, every set bit names an index the catalogue has)   else invalid_bitset
      (Core's own decode also refuses a bit introduced after cv; the catalogue endpoint does not publish
      introduced_in, so that one check is not repeated here -- Core never sets such a bit, and the token is signed.)
@@ -75,9 +81,12 @@ DEFAULT_AUTHZ_VER_CACHE_SECONDS = 2.0
 DEFAULT_REDIS_TIMEOUT_SECONDS = 0.5
 DEFAULT_CATALOGUE_RETRY_SECONDS = 10.0
 CATALOGUE_BEHIND_RETRY_SECONDS = 5.0
+DEFAULT_CATALOGUE_TIMEOUT_SECONDS = 10.0
+MAX_CATALOGUE_TIMEOUT_SECONDS = 30.0
 
 ENV_REDIS_URL = "PERMISSION_AUTHZ_VER_REDIS_URL"
 ENV_CACHE_SECONDS = "PERMISSION_AUTHZ_VER_CACHE_SECONDS"
+ENV_CATALOGUE_TIMEOUT_SECONDS = "PERMISSION_CATALOGUE_TIMEOUT_SECONDS"
 
 
 class InvalidBitset(ValueError):
@@ -180,9 +189,12 @@ class LocalEvaluator:
         authz_ver_cache_seconds: float = DEFAULT_AUTHZ_VER_CACHE_SECONDS,
         redis_timeout_seconds: float = DEFAULT_REDIS_TIMEOUT_SECONDS,
         catalogue_retry_seconds: float = DEFAULT_CATALOGUE_RETRY_SECONDS,
+        catalogue_timeout_seconds: float | None = None,
     ) -> None:
         self._core_url = core_url.rstrip("/")
-        self._timeout = timeout_seconds
+        # The catalogue fetch is the only HTTP call this evaluator makes. `timeout_seconds` (the permission-check timeout)
+        # is kept only as the fallback for a caller that builds an evaluator directly without a catalogue timeout.
+        self._timeout = catalogue_timeout_seconds if catalogue_timeout_seconds is not None else timeout_seconds
         self._transport = transport
         self._clock = clock
         self._client: httpx.AsyncClient | None = None
@@ -196,7 +208,7 @@ class LocalEvaluator:
         self._ver_cached: tuple[float, int | None, str | None] | None = None
         self._ver_task: asyncio.Task[tuple[int | None, str | None]] | None = None
         self._catalogue: Catalogue | None = None
-        self._cat_task: asyncio.Task[Catalogue] | None = None
+        self._cat_task: asyncio.Task[None] | None = None
         self._cat_blocked_until = float("-inf")
         self._cat_retry = catalogue_retry_seconds
 
@@ -211,6 +223,10 @@ class LocalEvaluator:
             return _fallback("error")
 
     async def aclose(self) -> None:
+        task = self._cat_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._cat_task = None
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -241,6 +257,9 @@ class LocalEvaluator:
         if not isinstance(cv, int) or isinstance(cv, bool) or cv < 1 or not isinstance(bits, str):
             return _fallback("no_perm")
 
+        # Before anything else can fall back: make sure a catalogue at >= cv is (being) loaded. Never awaited.
+        self._preload(cv, token, ctx)
+
         token_ver = claims.get("authz_ver")
         if not isinstance(token_ver, int) or isinstance(token_ver, bool):
             return _fallback("no_authz_ver", catalogue_version=cv)
@@ -252,10 +271,9 @@ class LocalEvaluator:
             return _fallback("authz_ver_stale", catalogue_version=cv, token_authz_ver=token_ver, current_authz_ver=current)
         fresh = {"catalogue_version": cv, "token_authz_ver": token_ver, "current_authz_ver": current}
 
-        try:
-            catalogue = await self._catalogue_for(cv, token, ctx)
-        except _CatalogueUnavailable:
-            return _fallback("catalogue_unavailable", **fresh)
+        catalogue = self._catalogue
+        if catalogue is None:
+            return _fallback("catalogue_loading" if self._cat_task is not None else "catalogue_unavailable", **fresh)
         if catalogue.version < cv:
             return _fallback("catalogue_behind", **fresh)
 
@@ -320,7 +338,7 @@ class LocalEvaluator:
         try:
             raw = await asyncio.wait_for(client.get(AUTHZ_VER_KEY), self._redis_timeout)
         except Exception as exc:  # noqa: BLE001 -- includes ACL NOPERM, timeouts, connection errors
-            _log.warning("permission_local_authz_ver_unavailable", extra={"error": type(exc).__name__})
+            _log.warning("permission_local_authz_ver_unavailable error=%s", type(exc).__name__, extra={"error": type(exc).__name__})
             return None, "authz_ver_unavailable"
         if raw is None:
             return None, "authz_ver_unset"
@@ -339,25 +357,37 @@ class LocalEvaluator:
             )
         return self._client
 
-    async def _catalogue_for(self, cv: int, token: str, ctx: AuthContext) -> Catalogue:
+    def _preload(self, cv: int, token: str, ctx: AuthContext) -> None:
+        """Start ONE background fetch when no catalogue at >= `cv` is held, none is in flight and no back-off applies.
+
+        Never awaited by a request: the caller falls back (catalogue_loading / catalogue_behind) until it has landed.
+        """
         held = self._catalogue
         if held is not None and held.version >= cv:
-            return held
-        if self._clock() < self._cat_blocked_until:
-            if held is not None:
-                return held  # the caller sees version < cv -> catalogue_behind
-            raise _CatalogueUnavailable()
+            return
         task = self._cat_task
-        if task is None:
-            task = asyncio.ensure_future(self._fetch_catalogue(token, ctx))
-            self._cat_task = task
-            task.add_done_callback(self._cat_settled)
-        fetched = await asyncio.shield(task)
+        if task is not None:
+            if not task.done() and task.get_loop() is asyncio.get_running_loop():
+                return  # already loading
+            self._cat_task = None  # left behind by a closed event loop (tests): start afresh
+        if self._clock() < self._cat_blocked_until:
+            return
+        task = asyncio.ensure_future(self._load(cv, token, ctx))
+        self._cat_task = task
+        task.add_done_callback(self._cat_settled)
+
+    async def _load(self, cv: int, token: str, ctx: AuthContext) -> None:
+        try:
+            fetched = await self._fetch_catalogue(token, ctx)
+        except _CatalogueUnavailable:
+            return  # logged and backed off in _catalogue_failed
+        except Exception as exc:  # noqa: BLE001 -- a background task: anything unexpected is logged, never raised
+            self._catalogue_failed(reason=f"error {type(exc).__name__}", back_off=True)
+            return
         if fetched.version < cv:
             self._cat_blocked_until = max(self._cat_blocked_until, self._clock() + CATALOGUE_BEHIND_RETRY_SECONDS)
-        return fetched
 
-    def _cat_settled(self, task: asyncio.Task[Catalogue]) -> None:
+    def _cat_settled(self, task: asyncio.Task[None]) -> None:
         if self._cat_task is task:
             self._cat_task = None
         if not task.cancelled():
@@ -384,11 +414,19 @@ class LocalEvaluator:
         held = self._catalogue
         if held is None or catalogue.version >= held.version:
             self._catalogue = catalogue
-            _log.info("permission_catalogue_loaded", extra={"catalogue_version": catalogue.version, "codes": len(catalogue.idx_by_code)})
+            _log.info(
+                "permission_catalogue_loaded catalogue_version=%s codes=%s", catalogue.version, len(catalogue.idx_by_code),
+                extra={"catalogue_version": catalogue.version, "codes": len(catalogue.idx_by_code)},
+            )
         return self._catalogue  # type: ignore[return-value]
 
     def _catalogue_failed(self, *, reason: str, back_off: bool) -> None:
-        _log.warning("permission_catalogue_fetch_failed", extra={"reason": reason, "back_off": back_off})
+        retry_in = self._cat_retry if back_off else 0.0
+        _log.warning(
+            "permission_catalogue_fetch_failed reason=%s back_off=%s retry_in_s=%s timeout_s=%s",
+            reason, back_off, retry_in, self._timeout,
+            extra={"reason": reason, "back_off": back_off, "timeout_seconds": self._timeout},
+        )
         if back_off:
             self._cat_blocked_until = self._clock() + self._cat_retry
 
@@ -402,3 +440,14 @@ def env_cache_seconds() -> float | None:
     except ValueError:
         return None
 
+
+def env_catalogue_timeout_seconds() -> float | None:
+    """PERMISSION_CATALOGUE_TIMEOUT_SECONDS, or None when unset. An unparsable value is ignored (with a warning)."""
+    raw = os.environ.get(ENV_CATALOGUE_TIMEOUT_SECONDS, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        _log.warning("permission_catalogue_timeout_invalid value=%r", raw, extra={"value": raw})
+        return None

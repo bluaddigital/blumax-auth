@@ -212,7 +212,8 @@ LOCAL_FALLBACK_REASONS = frozenset({
     "authz_ver_unavailable",     # Redis did not answer (timeout, error, NOPERM ACL)
     "authz_ver_unset",           # authctx:authz_ver is not in Redis (flushed, or the wrong Redis/db)
     "authz_ver_stale",           # token authz_ver != current: an authorization write happened since mint
-    "catalogue_unavailable",     # the catalogue could not be fetched from Core
+    "catalogue_loading",         # no catalogue yet: the background preload is in flight (0.6.1)
+    "catalogue_unavailable",     # no catalogue: the last fetch from Core failed (backing off)
     "catalogue_behind",          # Core's catalogue is older than the token's cv even after a refetch
     "invalid_bitset",            # bitset not base64url, or names an index the catalogue does not have
     "unknown_code",              # the code being checked is not in the catalogue

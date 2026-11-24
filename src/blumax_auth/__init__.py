@@ -8,7 +8,7 @@ was copied per service: OPD, IPD and Appointments each shipped a byte-identical
 41-line security.py, none of them wired up. Three copies of dead code is what
 drift looks like before it starts.
 """
-__version__ = "0.6.0"  # keep equal to pyproject.toml [project].version
+__version__ = "0.6.1"  # keep equal to pyproject.toml [project].version
 
 from blumax_auth.context import AuthContext
 from blumax_auth.errors import (

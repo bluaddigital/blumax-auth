@@ -191,7 +191,7 @@ def redis() -> FakeRedis:
 
 def configure(core: FakeCore, clock: FakeClock, redis: FakeRedis | None, **over: object) -> None:
     kwargs: dict[str, object] = dict(
-        core_url=CORE, ttl_seconds=30.0, timeout_seconds=2.0, transport=httpx.MockTransport(core.handle),
+        core_url=CORE, ttl_seconds=30.0, timeout_seconds=2.0, transport=httpx.MockTransport(lambda r: core.handle(r)),
         clock=clock, authz_ver_redis=redis,
     )
     kwargs.update(over)
@@ -231,12 +231,40 @@ async def client(signer):
         yield c
 
 
+async def settle() -> None:
+    """Wait for the background catalogue preload (0.6.1), if one is in flight."""
+    local = getattr(blumax_auth.permissions._checker, "local", None)
+    task = getattr(local, "_cat_task", None)
+    if task is not None:
+        await asyncio.wait([task])
+    await asyncio.sleep(0)
+
+
+def slow_catalogue(core: FakeCore, seconds: float) -> None:
+    """Delay only Core's catalogue answer (not /me/permissions)."""
+    inner = core.handle
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == CATALOGUE:
+            core.requests.append(request)
+            # MockTransport does not enforce httpx timeouts: honour the request's read timeout here, as a real socket would
+            read = (request.extensions.get("timeout") or {}).get("read")
+            if read is not None and seconds > read:
+                await asyncio.sleep(read)
+                raise httpx.ReadTimeout("catalogue too slow", request=request)
+            await asyncio.sleep(seconds)
+            core.requests.remove(request)  # inner records it again
+        return await inner(request)
+
+    core.handle = handle  # type: ignore[method-assign]
+
+
 def bearer(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
 def shadow_records(caplog, event: str = "permission_local_shadow") -> list[logging.LogRecord]:
-    return [r for r in caplog.records if r.name == LOGGER and r.getMessage() == event]
+    return [r for r in caplog.records if r.name == LOGGER and r.getMessage().split(" ", 1)[0] == event]
 
 
 def local_records(caplog) -> list[logging.LogRecord]:
@@ -431,7 +459,8 @@ class TestShadow:
         core.grant(token, HELD)
         assert await self._ask(client, "/held", token) == 200
         assert metrics.local_snapshot() == {"fallback:authz_ver_unavailable": 1}
-        assert core.calls(CATALOGUE) == 0  # freshness is checked before the catalogue is needed
+        await settle()
+        assert core.calls(CATALOGUE) == 1  # 0.6.1: the preload starts before the freshness check, so it still loads
 
     async def test_redis_key_absent(self, client, signer, core, redis):
         redis.value = None
@@ -487,9 +516,14 @@ class TestShadow:
         core.codes = {**core.codes, "new.code": 25}
         t2 = mint(signer, cv=4, codes=(HELD, "new.code"), catalogue=core.codes)
         core.grant(t2, HELD)
+        core.delay = 0.05  # the refetch is in the background: this request does not wait for it
         await self._ask(client, "/held", t2)
+        await settle()
+        core.delay = 0.0
         assert core.calls(CATALOGUE) == 2
-        assert metrics.local_snapshot() == {"match": 2}
+        assert metrics.local_snapshot() == {"match": 1, "fallback:catalogue_behind": 1}
+        await self._ask(client, "/held", t2)
+        assert metrics.local_snapshot() == {"match": 2, "fallback:catalogue_behind": 1}
         # an older cv decodes against the newer catalogue without another fetch
         t3 = mint(signer, cv=3)
         core.grant(t3, HELD)
@@ -636,11 +670,19 @@ class TestLocal:
         assert core.calls(PERMS) == 1
 
     async def test_concurrent_first_requests_share_one_catalogue_fetch_and_one_redis_read(self, client, signer, core, redis):
-        core.delay = 0.05
+        slow_catalogue(core, 0.3)
         tokens = [mint(signer) for _ in range(10)]
+        for t in tokens:
+            core.grant(t, HELD)
         rs = await asyncio.gather(*(client.get("/held", headers=bearer(t)) for t in tokens))
         assert {r.status_code for r in rs} == {200}
-        assert core.calls(CATALOGUE) == 1 and redis.gets == 1 and core.calls(PERMS) == 0
+        # ONE background fetch; nobody waited for it -- all ten asked Core while it loaded
+        assert core.calls(CATALOGUE) == 1 and redis.gets == 1 and core.calls(PERMS) == 10
+        assert metrics.local_snapshot() == {"fallback:catalogue_loading": 10}
+        await settle()
+        assert (await client.get("/held", headers=bearer(mint(signer)))).status_code == 200
+        assert core.calls(CATALOGUE) == 1 and core.calls(PERMS) == 10
+        assert metrics.local_snapshot()["local_allow"] == 1
 
     async def test_catalogue_fetched_with_the_callers_token_and_tenant(self, client, signer, core):
         token = mint(signer)
@@ -690,3 +732,181 @@ class TestLocalAdminRoutes:
             assert await blumax_auth.check_permission(ctx, token, HELD) is True
             assert await blumax_auth.check_permission(ctx, token, NOT_HELD) is False
         assert [r for r in caplog.records if r.getMessage().startswith("permission_local")] == []
+
+
+# ─── 0.6.1: catalogue timeout, background preload, reasons in the message text ─────────────────────────────────────
+
+class TestCatalogueTimeout:
+    def _local(self):
+        return blumax_auth.permissions._checker.local
+
+    def test_default_is_10_and_independent_of_the_check_timeout(self, core, clock, redis):
+        configure(core, clock, redis, local_mode="shadow", timeout_seconds=3.0)
+        assert self._local()._timeout == 10.0
+        assert self._local()._http().timeout.read == 10.0
+        assert blumax_auth.permissions._checker._timeout == 3.0
+
+    def test_explicit_and_env(self, core, clock, redis, monkeypatch):
+        configure(core, clock, redis, local_mode="shadow", catalogue_timeout_seconds=4.5)
+        assert self._local()._timeout == 4.5
+        monkeypatch.setenv("PERMISSION_CATALOGUE_TIMEOUT_SECONDS", "12")
+        configure(core, clock, redis, local_mode="shadow")
+        assert self._local()._timeout == 12.0
+        monkeypatch.setenv("PERMISSION_CATALOGUE_TIMEOUT_SECONDS", "nonsense")
+        configure(core, clock, redis, local_mode="shadow")
+        assert self._local()._timeout == 10.0
+
+    def test_capped_at_30_and_must_be_positive(self, core, clock, redis, caplog):
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            configure(core, clock, redis, local_mode="local", catalogue_timeout_seconds=120)
+        assert self._local()._timeout == 30.0
+        assert any(r.getMessage().startswith("permission_catalogue_timeout_clamped configured=120") for r in caplog.records)
+        with pytest.raises(ValueError):
+            configure(core, clock, redis, local_mode="local", catalogue_timeout_seconds=0)
+
+    def test_off_reads_nothing_and_logs_nothing(self, core, clock, redis, monkeypatch, caplog):
+        monkeypatch.setenv("PERMISSION_CATALOGUE_TIMEOUT_SECONDS", "nonsense")
+        with caplog.at_level(logging.DEBUG):
+            configure(core, clock, redis, catalogue_timeout_seconds=999)  # ignored: local_mode off
+        assert blumax_auth.permissions._checker.local is None
+        assert [r for r in caplog.records if r.name == LOGGER] == []
+
+    async def test_slow_catalogue_beyond_the_check_timeout_still_loads(self, client, signer, core, clock, redis):
+        configure(core, clock, redis, local_mode="local", timeout_seconds=0.05, catalogue_timeout_seconds=2.0)
+        slow_catalogue(core, 0.2)  # > the 0.05 s check timeout, < the 2 s catalogue timeout
+        token = mint(signer)
+        core.grant(token, HELD)
+        assert (await client.get("/held", headers=bearer(token))).status_code == 200  # Core, while loading
+        await settle()
+        assert self._local()._catalogue is not None
+        assert (await client.get("/held", headers=bearer(mint(signer)))).status_code == 200
+        assert metrics.local_snapshot() == {"fallback:catalogue_loading": 1, "local_allow": 1}
+
+    async def test_catalogue_timeout_fails_backs_off_and_says_why_in_the_message(self, client, signer, core, clock, redis, caplog):
+        configure(core, clock, redis, local_mode="local", catalogue_timeout_seconds=0.05)
+        slow_catalogue(core, 0.3)
+        token = mint(signer)
+        core.grant(token, HELD)
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            assert (await client.get("/held", headers=bearer(token))).status_code == 200
+            await settle()
+            assert (await client.get("/held", headers=bearer(token))).status_code == 200
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(m.startswith("permission_catalogue_fetch_failed reason=ReadTimeout back_off=True") for m in msgs), msgs
+        assert metrics.local_snapshot() == {"fallback:catalogue_loading": 1, "fallback:catalogue_unavailable": 1}
+        assert core.calls(CATALOGUE) == 1  # backed off: not refetched by the second request
+
+
+class TestBackgroundPreload:
+    async def test_first_request_never_waits_for_the_catalogue(self, client, signer, core, clock, redis):
+        configure(core, clock, redis, local_mode="local")
+        slow_catalogue(core, 0.5)
+        token = mint(signer)
+        core.grant(token, HELD)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        assert (await client.get("/held", headers=bearer(token))).status_code == 200
+        assert loop.time() - started < 0.4
+        assert metrics.local_snapshot() == {"fallback:catalogue_loading": 1}
+        assert core.calls(PERMS) == 1
+        await settle()
+        assert blumax_auth.permissions._checker.local._catalogue is not None
+
+    async def test_shadow_request_never_waits_for_the_catalogue(self, client, signer, core, clock, redis):
+        configure(core, clock, redis, local_mode="shadow")
+        slow_catalogue(core, 0.5)
+        token = mint(signer)
+        core.grant(token, HELD)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        assert (await client.get("/held", headers=bearer(token))).status_code == 200
+        assert loop.time() - started < 0.4
+        assert metrics.local_snapshot() == {"fallback:catalogue_loading": 1}
+        await settle()
+        token2 = mint(signer)
+        core.grant(token2, HELD)
+        await client.get("/held", headers=bearer(token2))
+        assert metrics.local_snapshot() == {"fallback:catalogue_loading": 1, "match": 1}
+
+    async def test_preload_starts_even_when_freshness_falls_back(self, client, signer, core, clock, redis):
+        configure(core, clock, redis, local_mode="local")
+        token = mint(signer, authz_ver=6)  # stale
+        core.grant(token, HELD)
+        await client.get("/held", headers=bearer(token))
+        await settle()
+        assert core.calls(CATALOGUE) == 1
+        assert metrics.local_snapshot() == {"fallback:authz_ver_stale": 1}
+
+    async def test_v1_and_service_tokens_do_not_start_a_preload(self, client, signer, core, clock, redis):
+        configure(core, clock, redis, local_mode="local")
+        for token in (mint(signer, v2=False), mint(signer, type="service")):
+            core.grant(token, HELD)
+            await client.get("/held", headers=bearer(token))
+        await settle()
+        assert core.calls(CATALOGUE) == 0
+
+    async def test_unexpected_preload_error_is_logged_and_backed_off(self, client, signer, core, clock, redis, caplog):
+        configure(core, clock, redis, local_mode="local")
+
+        async def boom(*a, **k):
+            raise RuntimeError("bug")
+
+        blumax_auth.permissions._checker.local._fetch_catalogue = boom
+        token = mint(signer)
+        core.grant(token, HELD)
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            assert (await client.get("/held", headers=bearer(token))).status_code == 200
+            await settle()
+        assert any(r.getMessage().startswith("permission_catalogue_fetch_failed reason=error RuntimeError") for r in caplog.records)
+        assert blumax_auth.permissions._checker.local._cat_blocked_until > clock()
+
+    async def test_aclose_cancels_an_inflight_preload(self, client, signer, core, clock, redis):
+        configure(core, clock, redis, local_mode="local")
+        slow_catalogue(core, 5)
+        token = mint(signer)
+        core.grant(token, HELD)
+        await client.get("/held", headers=bearer(token))
+        task = blumax_auth.permissions._checker.local._cat_task
+        assert task is not None and not task.done()
+        await blumax_auth.aclose_permissions()
+        await asyncio.sleep(0)
+        assert task.cancelled()
+
+
+class TestReasonInMessageText:
+    async def test_shadow_fallback_line_carries_the_reason_in_the_text(self, client, signer, core, clock, redis, caplog):
+        configure(core, clock, redis, local_mode="shadow")
+        token = mint(signer, authz_ver=6)
+        core.grant(token, HELD)
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            await client.get("/held", headers=bearer(token))
+        [rec] = shadow_records(caplog)
+        assert rec.getMessage() == (
+            f"permission_local_shadow outcome=fallback reason=authz_ver_stale code={HELD} route=/held core=allow "
+            "catalogue_version=3 token_authz_ver=6 current_authz_ver=7"
+        )
+        assert (rec.outcome, rec.reason, rec.permission, rec.route) == ("fallback", "authz_ver_stale", HELD, "/held")
+
+    async def test_mismatch_line_carries_both_decisions(self, client, signer, core, clock, redis, caplog):
+        configure(core, clock, redis, local_mode="shadow")
+        warm = mint(signer)
+        core.grant(warm, HELD)
+        await client.get("/held", headers=bearer(warm))
+        await settle()
+        token = mint(signer, codes=())
+        core.grant(token, HELD)
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            await client.get("/held", headers=bearer(token))
+        [rec] = shadow_records(caplog)
+        assert rec.getMessage().startswith(f"permission_local_shadow outcome=mismatch reason=- code={HELD} route=/held core=allow local=deny")
+
+    async def test_local_fallback_line_and_loading_reason(self, client, signer, core, clock, redis, caplog):
+        configure(core, clock, redis, local_mode="local")
+        slow_catalogue(core, 0.2)
+        token = mint(signer)
+        core.grant(token, HELD)
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            await client.get("/held", headers=bearer(token))
+        [rec] = shadow_records(caplog, "permission_local_fallback")
+        assert rec.getMessage().startswith(f"permission_local_fallback outcome=fallback reason=catalogue_loading code={HELD} route=/held")
+        await settle()

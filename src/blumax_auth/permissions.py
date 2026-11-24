@@ -130,7 +130,18 @@ local   The decision comes from the token when its answer is usable (counted loc
 
 Platform admins pass before any of this, in every mode (unchanged). Service tokens always use the Core path
 (fallback service_token) until service tokens v2 (G8). Fallback reasons and the freshness rule: local_permissions.py.
-A service that wraps `_Checker.granted` itself (IPD/OPD permission_resilience.py) keeps calling Core in every mode.
+
+Where the local decision sits: in `_decide()`, which require_permission() and check_permission() call, ABOVE
+`_Checker.granted`. `granted` is only the Core path. A service that wraps `_Checker.granted` itself (IPD/OPD
+app/core/permission_resilience.py: retry + stale-on-error) therefore still gets local evaluation in "shadow" and
+"local"; its wrapper applies to the Core path only -- the decision in "off" / "shadow", the fallbacks in "local"
+(tests/test_local_with_resilience_wrapper.py runs OPD's install() verbatim against all three modes).
+
+The catalogue is preloaded in the background on first use and never waited for (local_permissions.py, step 5);
+its fetch has its own timeout, catalogue_timeout_seconds (env PERMISSION_CATALOGUE_TIMEOUT_SECONDS, default 10 s,
+capped at 30 s), independent of timeout_seconds. The shadow / fallback / catalogue log lines carry their fields in the
+message text too (`permission_local_shadow outcome=fallback reason=catalogue_loading code=... route=...`) as well as in
+`extra`, so a formatter that drops `extra` still shows why.
 """
 from __future__ import annotations
 
@@ -154,11 +165,14 @@ from blumax_auth.errors import AuthError, Forbidden, InvalidToken, MissingCreden
 from blumax_auth.fastapi import _bearer, require_tenant
 from blumax_auth.local_permissions import (
     DEFAULT_AUTHZ_VER_CACHE_SECONDS,
+    DEFAULT_CATALOGUE_TIMEOUT_SECONDS,
     ENV_REDIS_URL,
     MAX_AUTHZ_VER_CACHE_SECONDS,
+    MAX_CATALOGUE_TIMEOUT_SECONDS,
     LocalDecision,
     LocalEvaluator,
     env_cache_seconds,
+    env_catalogue_timeout_seconds,
 )
 from blumax_auth.metrics import core_permission_call as _count
 from blumax_auth.metrics import permission_local_event as _count_local
@@ -347,7 +361,19 @@ class _Checker:
             value = getattr(decision, name)
             if value is not None:
                 extra[name] = value
-        _log.log(logging.WARNING if outcome == "mismatch" else logging.INFO, event, extra=extra)
+        # The same facts in the message text: some services' formatters drop `extra` (Appointments showed only the
+        # event name). Plain scalars only, never a token or a permission list.
+        text = f"{event} outcome={extra['outcome']} reason={decision.reason or '-'} code={code} route={extra['route']}"
+        if "core_decision" in extra:
+            text += f" core={extra['core_decision']}"
+        if "local_decision" in extra:
+            text += f" local={extra['local_decision']}"
+        for name in ("catalogue_version", "token_authz_ver", "current_authz_ver"):
+            if name in extra:
+                text += f" {name}={extra[name]}"
+        if extra["suppressed"]:
+            text += f" suppressed={extra['suppressed']}"
+        _log.log(logging.WARNING if outcome == "mismatch" else logging.INFO, "%s", text, extra=extra)
 
     def clear(self) -> None:
         self._cache.clear()
@@ -543,6 +569,7 @@ def configure_permissions(
     authz_ver_cache_seconds: float | None = None,
     shadow_log_interval_seconds: float = 60.0,
     authz_ver_redis: object | None = None,
+    catalogue_timeout_seconds: float | None = None,
 ) -> None:
     """Point this service at Core for permission checks. Call once, at startup.
 
@@ -573,6 +600,9 @@ def configure_permissions(
                         PERMISSION_AUTHZ_VER_CACHE_SECONDS -> 2. Clamped to 0..5.
     shadow_log_interval_seconds  Rate limit of the shadow / fallback log lines per (outcome, reason, permission).
     authz_ver_redis     Test seam: an object with `async get(key)` used instead of a URL.
+    catalogue_timeout_seconds  Timeout of the (background) catalogue fetch, independent of timeout_seconds. None -> env
+                        PERMISSION_CATALOGUE_TIMEOUT_SECONDS -> 10. Must be > 0; clamped to 30. Read only when
+                        local_mode != "off".
     """
     global _checker
     if not core_url or not core_url.strip():
@@ -612,13 +642,30 @@ def configure_permissions(
                 "permission_authz_ver_cache_clamped",
                 extra={"configured": cache_seconds, "max": MAX_AUTHZ_VER_CACHE_SECONDS},
             )
+        cat_timeout = catalogue_timeout_seconds
+        if cat_timeout is None:
+            cat_timeout = env_catalogue_timeout_seconds()
+        if cat_timeout is None:
+            cat_timeout = DEFAULT_CATALOGUE_TIMEOUT_SECONDS
+        if cat_timeout <= 0:
+            raise ValueError("catalogue_timeout_seconds must be > 0")
+        if cat_timeout > MAX_CATALOGUE_TIMEOUT_SECONDS:
+            _log.warning(
+                "permission_catalogue_timeout_clamped configured=%s max=%s", cat_timeout, MAX_CATALOGUE_TIMEOUT_SECONDS,
+                extra={"configured": cat_timeout, "max": MAX_CATALOGUE_TIMEOUT_SECONDS},
+            )
+            cat_timeout = MAX_CATALOGUE_TIMEOUT_SECONDS
         local = LocalEvaluator(
             core_url=core_url, timeout_seconds=timeout_seconds, transport=transport, clock=clock,
             redis=authz_ver_redis,
             redis_url=authz_ver_redis_url or os.environ.get(ENV_REDIS_URL, "").strip() or None,
             authz_ver_cache_seconds=cache_seconds,
+            catalogue_timeout_seconds=cat_timeout,
         )
-        _log.info("permission_local_mode", extra={"local_mode": local_mode})
+        _log.info(
+            "permission_local_mode local_mode=%s catalogue_timeout_s=%s", local_mode, cat_timeout,
+            extra={"local_mode": local_mode, "catalogue_timeout_seconds": cat_timeout},
+        )
     _checker = _Checker(
         local=local,
         local_mode=local_mode,

@@ -2,6 +2,34 @@
 
 Started with 0.5.2; earlier releases are described in their tag commits (`git log v0.5.1`).
 
+## 0.6.1 (unreleased: no tag yet, the owner tags it)
+
+G6 preparation: local evaluation is usable by every service and never slows a request. **local_mode="off" (the
+default) is unchanged**: no catalogue fetch, no Redis read, no new setting read, no new log line.
+
+- **Catalogue fetch has its own timeout**: `configure_permissions(catalogue_timeout_seconds=...)`, env
+  `PERMISSION_CATALOGUE_TIMEOUT_SECONDS`, default 10 s, must be > 0, clamped to 30 s (with a
+  `permission_catalogue_timeout_clamped` warning). Independent of `timeout_seconds` (the per-check timeout). Before,
+  the fetch reused the check timeout, so a 5.4 s catalogue answer on a busy dev host failed every time
+  (`permission_catalogue_fetch_failed`, fallback, 10 s back-off, repeat).
+- **Background preload, never awaited**: the first staff v2 token a process sees (or the first naming a newer `cv`)
+  starts ONE background catalogue fetch (single-flight; a failure is logged and backs off 10 s exactly as before).
+  No request waits for it -- in local mode it asks Core, in shadow mode it is counted
+  `fallback:catalogue_loading` -- until the catalogue has landed. The preload starts before the freshness check, so
+  a stale / unset `authz_ver` no longer keeps the catalogue from loading. (There is no preload at configure time:
+  Core's catalogue endpoint needs an authenticated caller and the library has no token of its own until the first
+  request.) In 0.6.0 a shadow-mode request awaited the fetch after Core had answered; it no longer does.
+  New fallback reason `catalogue_loading`; `catalogue_unavailable` now means "no catalogue, last fetch failed".
+- **Reasons in the message text**: `permission_local_shadow`, `permission_local_fallback`,
+  `permission_catalogue_fetch_failed`, `permission_catalogue_loaded`, `permission_local_authz_ver_unavailable` and
+  `permission_local_mode` now carry their fields in the message as well as in `extra`, e.g.
+  `permission_local_shadow outcome=fallback reason=catalogue_loading code=opd.visit.read route=/opd/visits/{visit_id}`
+  (formatters that drop `extra` showed only the event name).
+- **Services that wrap `_Checker.granted`** (IPD/OPD `app/core/permission_resilience.py`): the 0.6.0 note saying
+  they "keep asking Core" was wrong. The local decision is taken in `permissions._decide()`, above `granted`, so those
+  services get local evaluation in shadow and local mode; their wrapper applies to the Core path only. Now covered by
+  `tests/test_local_with_resilience_wrapper.py`, which runs OPD's `install()` verbatim in off / shadow / local mode.
+
 ## 0.6.0 (unreleased: no tag yet, the owner tags it)
 
 Authorization modernisation G5: access token v2 is verified, and permissions can be evaluated LOCALLY from the token,
@@ -36,7 +64,7 @@ tip): the same Core calls, the same cache, the same decisions, the same log line
   default: reuse the client `configure_session_revocation()` built), `authz_ver_cache_seconds` (env
   `PERMISSION_AUTHZ_VER_CACHE_SECONDS`, clamped to 5), `shadow_log_interval_seconds` (60), `authz_ver_redis` (test seam).
 - Platform admins pass first in every mode (unchanged); service tokens always use the Core path until service tokens v2
-  (G8). Services that wrap `_Checker.granted` themselves (IPD/OPD `permission_resilience.py`) keep asking Core.
+  (G8). (Corrected in 0.6.1: services that wrap `_Checker.granted` themselves DO get local evaluation.)
 - New counters: `blumax_permission_local_total{outcome}`, `blumax_token_service_audience_missing_total`;
   `metrics.local_snapshot()`, `metrics.audience_snapshot()`.
 
