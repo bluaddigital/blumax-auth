@@ -31,5 +31,11 @@ blumax-platform `docs/architecture/service-dependency-map.md`:
   prometheus_client is optional (`pip install blumax-auth[metrics]`), missing -> one warning.
 - `blumax_auth.__version__`.
 
+Tests only (SEC-09 / SEC-10, no library change): `tests/test_revocation_matrix.py`, the executable expiry / revocation matrix run once per
+consuming service's real wiring (15 profiles), with the Redis down / hung / flushed / evicted / restarted rows and their documented
+expectations; opt-in real-Redis container tests (`BLUMAX_AUTH_TEST_REDIS_CONTAINER=1`) and a wiring check against the sibling repositories
+(`BLUMAX_CONSUMERS_ROOT`). It pins the residual window (a flushed or evicted marker re-validates a revoked session in `open` AND `closed`)
+and the services that verify tokens but never check revocation (DIS, CDSS, WA service, Composer).
+
 JWKS (APP-005, PR #12): after the TTL with Core unreachable a held key is served at once inside
 the unchanged 24 h stale bound; one caller refreshes; a failed refresh backs off 10 s.
