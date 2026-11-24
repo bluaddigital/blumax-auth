@@ -9,7 +9,7 @@ from typing import Any
 
 from jose import JWTError, jwt
 
-from blumax_auth.context import AuthContext
+from blumax_auth.context import Actor, AuthContext
 from blumax_auth.errors import InvalidToken
 from blumax_auth.jwks import JwksCache
 from blumax_auth.metrics import service_audience_missing as _count_audience_missing
@@ -236,4 +236,23 @@ def _to_context(claims: dict[str, Any], *, is_service: bool) -> AuthContext:
         active_facility_id=active_facility_id,
         assigned_facility_ids=assigned_facility_ids,
         session_id=_optional_uuid(claims, "sid"),
+        actor=_actor(claims, is_service=is_service),
     )
+
+
+def _actor(claims: dict[str, Any], *, is_service: bool) -> Actor | None:
+    """The `act` claim (RFC 8693) of a delegated token, or None. Present but malformed -> refused: a token that names
+    an actor nobody can read must not pass as the user's own. Core never puts `act` on a service token."""
+    act = claims.get("act")
+    if act is None:
+        return None
+    if is_service:
+        raise InvalidToken("A service token cannot carry an actor")
+    if not isinstance(act, dict):
+        raise InvalidToken("Token claim 'act' is malformed")
+    try:
+        sid = uuid.UUID(str(act.get("sub")))
+    except ValueError as exc:
+        raise InvalidToken("Token claim 'act.sub' is not a valid UUID") from exc
+    svc = act.get("svc")
+    return Actor(service_account_id=sid, service_name=svc if isinstance(svc, str) and svc else None)

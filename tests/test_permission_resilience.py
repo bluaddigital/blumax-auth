@@ -105,8 +105,8 @@ def test_negative_settings_are_refused(bad):
         blumax_auth.configure_permissions(core_url=CORE, **bad)
 
 
-def test_version_is_0_6_2():
-    assert blumax_auth.__version__ == "0.6.2"
+def test_version_is_0_6_4():
+    assert blumax_auth.__version__ == "0.6.4"
 
 
 # ─── C3: retry once on NO answer ──────────────────────────────────────────────

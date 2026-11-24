@@ -7,6 +7,18 @@ from datetime import datetime
 
 
 @dataclass(frozen=True)
+class Actor:
+    """The party acting FOR the token's subject (0.6.4, G8): RFC 8693's `act` claim on a delegated token minted by
+    Core's POST /auth/token-exchange. `user_id` (sub) is then the human; the actor is the service account that called.
+    For audit only -- the delegated token's permissions are already the human's INTERSECT the service's scopes."""
+
+    #: act.sub -- the Core service account id.
+    service_account_id: uuid.UUID
+    #: act.svc -- the service account's name ("platform-labs-lab-order-consumer"); None if Core did not say.
+    service_name: str | None = None
+
+
+@dataclass(frozen=True)
 class AuthContext:
     """Everything a service knows about the caller, taken from signed claims.
 
@@ -72,6 +84,14 @@ class AuthContext:
     # their source session's sid. None for v1 tokens, service tokens and a malformed claim. Used only by
     # session_revocation.py to honour Core's per-session marker (Phase 5b); never an authorization input.
     session_id: uuid.UUID | None = None
+    # 0.6.4 (G8): who is acting for `user_id` when the token is a delegated one (Core token exchange, `act` claim); None
+    # for a user's own token and for a service token. Record it in audit rows ("via service X on behalf of user Y").
+    actor: Actor | None = None
+
+    @property
+    def is_delegated(self) -> bool:
+        """True for a token a service obtained by exchanging a user's token (the `act` claim)."""
+        return self.actor is not None
 
     @property
     def is_facility_bound(self) -> bool:
