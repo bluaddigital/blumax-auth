@@ -209,7 +209,7 @@ def revoke_all_refresh_tokens_stmt(user_id: uuid.UUID):
 
 
 async def refresh(
-    db: AsyncSession, *, refresh_token: str, tenant_id: uuid.UUID | None = None,
+    db: AsyncSession, *, refresh_token: str, tenant_id: uuid.UUID | None = None, redis: Redis | None = None,
 ) -> tuple[str, str]:
     try:
         claims = decode_token(refresh_token, expected_type="refresh")
@@ -283,6 +283,16 @@ async def refresh(
         await db.commit()
         logger.info("refresh.failed", reason="inactive_user", user_id=str(row.user_id), jti=str(token_id))
         raise AuthenticationError("Account is deactivated")
+
+    # The shared Redis marker (written by Core's force_login/logout and by this service's own revocations) also
+    # ends a refresh token whose row was created at or before it. Compared against the row's own full-precision
+    # created_at, not the JWT's whole-second iat, so a login right after a revocation is not caught by rounding.
+    # An unreachable/malformed marker follows SESSION_REVOCATION_FAIL_MODE exactly like the access-token check.
+    if redis is not None and await is_session_revoked(
+        redis, user_id=str(row.user_id), issued_at=row.created_at.timestamp(),
+    ):
+        logger.info("refresh.failed", reason="session_revoked", user_id=str(row.user_id), jti=str(token_id))
+        raise AuthenticationError("Session has been revoked")
 
     # Rotate: revoke this row, issue a brand-new one.
     row.revoked = True

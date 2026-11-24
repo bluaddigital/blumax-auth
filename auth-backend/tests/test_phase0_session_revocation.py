@@ -185,7 +185,7 @@ async def test_user_sync_that_keeps_the_user_active_revokes_nothing(
     client: AsyncClient, db_session: AsyncSession, test_user: User, _fresh_redis_per_test: Redis,
 ):
     await _login(client)
-    for fields in ({"is_active": True}, {}):  # explicit active, and a bare password-changed-shaped event
+    for fields in ({"is_active": True}, {"identifier": "alice@example.test", "username": "alice"}):  # unchanged password, still active
         assert (await _sync(client, test_user, **fields)).status_code == 204
     assert len(await _live_rows(db_session, test_user.id)) == 1
     assert await _marker(_fresh_redis_per_test, test_user.id) is None

@@ -55,11 +55,23 @@ def _key(user_id: str) -> str:
     return f"{_PREFIX}:{user_id}"
 
 
-async def revoke_user_sessions(redis: Redis, user_id: str) -> None:
-    await redis.set(
-        _key(user_id), datetime.now(UTC).isoformat(), ex=settings.SESSION_REVOCATION_TTL_SECONDS,
-    )
+async def revoke_user_sessions(redis: Redis, user_id: str) -> bool:
+    """Write the revoked-after marker. Callers run this AFTER the database commit that revoked the refresh rows,
+    and the DATABASE is authoritative for refresh tokens: a Redis failure here is logged loudly and returned as
+    False, never raised (it must not turn an already-committed password change / logout / sync into a 500).
+    Access tokens already issued then live until their own expiry, which the log line makes alertable."""
+    try:
+        await redis.set(
+            _key(user_id), datetime.now(UTC).isoformat(), ex=settings.SESSION_REVOCATION_TTL_SECONDS,
+        )
+    except Exception as exc:
+        logger.error(
+            "session_revocation.marker_write_failed",
+            user_id=user_id, error=str(exc), db_rows_revoked=True,
+        )
+        return False
     logger.info("session_revocation.revoked", user_id=user_id)
+    return True
 
 
 async def is_session_revoked(redis: Redis, *, user_id: str, issued_at: float) -> bool:

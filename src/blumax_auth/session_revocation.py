@@ -122,13 +122,16 @@ sensitive and stale_age_seconds.
 
 Optional per-process status cache: SESSION_STATUS_CACHE_SECONDS (default 0 = off, exact old behaviour)
 -------------------------------------------------------------------------------------------------
-With a value > 0 (2-5 recommended) a definitive answer (not revoked / revoked) is remembered per
+With a value > 0 (3 recommended; values above 5 are CLAMPED to 5 with a `session_status_cache_seconds_clamped`
+warning: an ordinary read never relies on a status older than 5 s) a definitive answer (not revoked / revoked) is remembered per
 (user_id, iat, jti) so ordinary requests do not read the store each time. Bounded LRU
 (SESSION_STATUS_CACHE_MAX_ENTRIES, default 10000), single-flight (concurrent requests for the same key share ONE
 store read), expiry jittered 0-20 % shorter so entries do not all lapse together. A "not revoked" answer is trusted
 for at most the TTL, so a revocation is visible within the TTL. A "revoked" answer is remembered for the marker's
-whole life (26 h). An unavailable/malformed answer is NEVER cached; it follows the fail_mode policy. Sensitive
-routes bypass the cache (fresh read). Counters: cache_hit, cache_miss, store_reads.
+whole life (26 h) and is NEVER restored by TTL expiry or a store outage: in enforce mode a session this process
+already saw revoked is refused (401) whenever the store cannot answer, in every fail_mode. An unavailable/malformed
+answer is NEVER cached; it follows the fail_mode policy. Sensitive routes bypass the cache (fresh read) and, under
+fail_mode="split", fail closed when a fresh status cannot be established. Counters: cache_hit, cache_miss, store_reads.
 
 Rollout mode
 ------------
@@ -210,6 +213,10 @@ SENSITIVE_STATE_ATTR = "blumax_sensitive_route"
 CACHE_SECONDS_ENV = "SESSION_STATUS_CACHE_SECONDS"
 CACHE_MAX_ENTRIES_ENV = "SESSION_STATUS_CACHE_MAX_ENTRIES"
 DEFAULT_CACHE_MAX_ENTRIES = 10000
+#: Freshness ceiling for ordinary reads: SESSION_STATUS_CACHE_SECONDS above this is clamped (with a warning).
+#: Recommended value when the cache is enabled: RECOMMENDED_CACHE_SECONDS. Off (0) stays the default.
+MAX_CACHE_SECONDS = 5.0
+RECOMMENDED_CACHE_SECONDS = 3.0
 CACHE_JITTER = 0.2  # an entry lives between 80 % and 100 % of the TTL
 #: A revoked answer cannot become "not revoked" again (the marker only moves forward), so it is kept as long as the
 #: marker itself lives (Core: 26 h), well past any token's own expiry.
@@ -269,6 +276,20 @@ def _cache_seconds_from_env() -> float:
     return max(_float_env(CACHE_SECONDS_ENV, 0.0), 0.0)
 
 
+def clamp_cache_seconds(value: float) -> float:
+    """The status-cache TTL actually used: never negative, never above MAX_CACHE_SECONDS (owner rule: an ordinary
+    read may rely on a session status at most 5 s old). A larger configured value is clamped with a WARNING."""
+    if not value > 0:  # also NaN
+        return 0.0
+    if value > MAX_CACHE_SECONDS:
+        _log.warning(
+            "session_status_cache_seconds_clamped",
+            extra={"configured": value, "used": MAX_CACHE_SECONDS, "max": MAX_CACHE_SECONDS},
+        )
+        return MAX_CACHE_SECONDS
+    return value
+
+
 def _cache_max_from_env() -> int:
     return max(int(_float_env(CACHE_MAX_ENTRIES_ENV, DEFAULT_CACHE_MAX_ENTRIES)), 1)
 
@@ -313,7 +334,7 @@ class _Checker:
         # Session-status cache (off when cache_seconds <= 0). `_revoked` is kept in every configuration (bounded,
         # revoked answers only) so split mode never forgets a session it saw revoked; it only ANSWERS requests
         # when the cache is on, or in split's unavailable path.
-        self.cache_seconds = max(cache_seconds, 0.0)
+        self.cache_seconds = clamp_cache_seconds(cache_seconds)
         self.cache_max_entries = max(cache_max_entries, 1)
         self._valid: OrderedDict[tuple, float] = OrderedDict()
         self._revoked: OrderedDict[tuple, tuple[float, datetime | None]] = OrderedDict()
@@ -643,6 +664,10 @@ async def _check(ctx: AuthContext, request: Request | None, *, sensitive: bool) 
             )
         if checker.mode == "warn":
             _emit(ctx, decision="check_failed" if failed else "allow", reason=reason)
+        elif unavailable and checker.known_revoked(ctx.user_id, ctx.issued_at, ctx.jti)[0]:
+            # A store outage (or the breaker window) never restores a session this process already saw revoked.
+            _metrics.session_revocation_event("revoked")
+            raise InvalidToken("Session has been revoked")
         elif failed and checker.fail_mode == "closed":
             raise InvalidToken("Session has been revoked")
         elif failed and checker.fail_mode == "split":
