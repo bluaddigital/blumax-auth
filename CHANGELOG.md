@@ -2,7 +2,45 @@
 
 Started with 0.5.2; earlier releases are described in their tag commits (`git log v0.5.1`).
 
-## Unreleased (next version after 0.5.2: no tag, no version bump; the owner tags)
+## 0.6.0 (unreleased: no tag yet, the owner tags it)
+
+Authorization modernisation G5: access token v2 is verified, and permissions can be evaluated LOCALLY from the token,
+starting in shadow mode. **With default settings nothing changes** (every BluMax service builds blumax-auth from the dev
+tip): the same Core calls, the same cache, the same decisions, the same log lines. Everything below is opt-in.
+
+- **Dual-profile verify.** v1 tokens verify exactly as before. v2 tokens (`ver: 2`, header `typ: at+jwt`) verify the
+  same way: `aud` is a list that always contains "blumax", which python-jose accepts against the configured audience;
+  `nbf` is enforced (with the existing 30 s leeway). New optional `configure(..., service_audience="blumax-opd")`
+  (default None = no check): OBSERVE ONLY in 0.6.0 -- a v2 token whose aud list lacks it is still accepted, counted
+  (`blumax_token_service_audience_missing_total`) and logged (`token_service_audience_missing`, at most once a minute).
+  Refusing it is G6. `typ` is not checked yet (G6).
+- **Local evaluator** (`blumax_auth/local_permissions.py`): the token's `perm = {cv, b}` bitset decoded against Core's
+  catalogue (`GET /api/v1/authz/catalogue`, fetched lazily with the caller's own token, cached per version, refetched
+  when a token names a newer cv, single-flight, 10 s back-off after a failure). Bitset format mirrors Core's
+  `permission_index.pack_indexes` byte for byte (tested against a verbatim copy of Core's encoder).
+- **Freshness**: Core's global `authctx:authz_ver` is read from Redis (≤ 5 s per-process cache, default 2 s) and must
+  EQUAL the token's `authz_ver` (`!=`, not `<`: a flushed Redis restarts at 0). Missing claim, Redis unavailable, key
+  absent, or a different value -> the local answer is not used.
+- **Modes**: `configure_permissions(..., local_mode="off"|"shadow"|"local")`, or env `PERMISSION_LOCAL_MODE` when the
+  argument is omitted; default **off** (the evaluator is not even built). shadow = Core still decides, the token's
+  answer is compared, counted `blumax_permission_local_total{outcome="match"|"mismatch"|"fallback:<reason>"}` and
+  logged `permission_local_shadow` on mismatch (WARNING) or fallback (INFO; v1/service tokens counted only),
+  rate-limited per (outcome, reason, permission) to one line a minute. local = the token decides when usable
+  (`local_allow`/`local_deny`), any fallback asks Core exactly as before, and routes marked `admin=True` always ask
+  Core; never a grant or a denial on doubt;
+  warn/enforce unchanged (a warn line for a local decision carries `source="local"`).
+- Fallback reasons: `v1_token`, `service_token`, `admin_route` (local mode), `token_unreadable`, `no_perm`, `no_authz_ver`,
+  `authz_ver_not_configured`, `authz_ver_unavailable`, `authz_ver_unset`, `authz_ver_stale`, `catalogue_unavailable`,
+  `catalogue_behind`, `invalid_bitset`, `unknown_code`, `error`.
+- New configure_permissions arguments: `local_mode`, `authz_ver_redis_url` (env `PERMISSION_AUTHZ_VER_REDIS_URL`;
+  default: reuse the client `configure_session_revocation()` built), `authz_ver_cache_seconds` (env
+  `PERMISSION_AUTHZ_VER_CACHE_SECONDS`, clamped to 5), `shadow_log_interval_seconds` (60), `authz_ver_redis` (test seam).
+- Platform admins pass first in every mode (unchanged); service tokens always use the Core path until service tokens v2
+  (G8). Services that wrap `_Checker.granted` themselves (IPD/OPD `permission_resilience.py`) keep asking Core.
+- New counters: `blumax_permission_local_total{outcome}`, `blumax_token_service_audience_missing_total`;
+  `metrics.local_snapshot()`, `metrics.audience_snapshot()`.
+
+Also in 0.6.0 (merged to dev after 0.5.2, before G5):
 
 Phase 0 security (JWT/SSO audit D-1, B2). Additive; every default is unchanged.
 
