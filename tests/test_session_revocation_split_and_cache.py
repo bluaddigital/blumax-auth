@@ -365,11 +365,11 @@ async def test_a_revoked_answer_is_cached_for_its_full_life(make_client, signer,
 
 
 async def test_valid_entries_expire_with_jitter_never_beyond_the_ttl(make_client, signer, redis, clock):
-    client = make_client(cache_seconds=10)
+    client = make_client(cache_seconds=5)
     for _ in range(30):
         await client.get("/r", headers=auth(signer))
     lives = [exp - clock.now for exp in sr._checker._valid.values()]
-    assert all(8.0 <= life <= 10.0 for life in lives)
+    assert all(4.0 <= life <= 5.0 for life in lives)
     assert len({round(life, 6) for life in lives}) > 1, "expiries are spread, not identical"
 
 

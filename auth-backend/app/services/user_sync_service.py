@@ -84,16 +84,24 @@ async def sync_user_from_core(
                 )
             existing.identifier = normalized
         existing.username = username
+    # user.password_changed: Core sends only user_id + hashed_password, so a bare event (no identifier/username/
+    # is_active) IS a password change; a changed hash on any event is one too. Like deactivation it runs on every
+    # such event (a relay retry after a failed marker write repairs it).
+    password_changed = hashed_password != existing.hashed_password or (
+        identifier is None and username is None and is_active is None
+    )
     existing.hashed_password = hashed_password
     if is_active is not None:
         existing.is_active = is_active
     deactivating = is_active is False
-    if deactivating:
+    ending_sessions = deactivating or password_changed
+    if ending_sessions:
         await db.execute(revoke_all_refresh_tokens_stmt(user_id))
     await db.commit()
-    if deactivating:
+    if ending_sessions:
+        reason = "deactivated" if deactivating else "password_changed"
         if redis is None:
-            logger.error("user_sync.deactivation_marker_not_written", user_id=str(user_id), reason="no_redis")
+            logger.error("user_sync.session_marker_not_written", user_id=str(user_id), reason="no_redis", cause=reason)
         else:
             await revoke_user_sessions(redis, str(user_id))
-        logger.info("user_sync.deactivated", user_id=str(user_id))
+        logger.info(f"user_sync.{reason}", user_id=str(user_id))

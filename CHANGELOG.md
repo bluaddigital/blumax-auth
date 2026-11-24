@@ -28,6 +28,19 @@ Phase 0 security (JWT/SSO audit D-1, B2). Additive; every default is unchanged.
 - New exports: `SessionRevocationUnavailable`, `session_revocation_check`. `check_session_revocation` gained an
   optional `request` parameter (injected by FastAPI; a direct call without it is treated as a write under split).
 
+Wave 2 (authorization migration plan, owner decisions). Additive.
+
+- **Status-cache freshness ceiling**: `SESSION_STATUS_CACHE_SECONDS` is clamped to 5 s (a larger value logs
+  `session_status_cache_seconds_clamped` and 5 is used); 3 is the recommended value when enabled; default stays 0 (off).
+  A session already seen revoked is refused (401) during any store outage or breaker window, in every `fail_mode`
+  (previously only split's stale-read path did this); sensitive routes never use the cache and, under `split`, fail
+  closed when a fresh status cannot be established. New helper `clamp_cache_seconds`.
+- **auth-backend (standalone Blumax Auth, dormant)**: `/auth/refresh` also consults the Redis session marker
+  (refresh row created at or before it is refused; follows `SESSION_REVOCATION_FAIL_MODE`); a `user.password_changed`
+  sync event (bare user_id + hashed_password, or any event with a changed hash) revokes the user's refresh rows and
+  writes the marker; `revoke_user_sessions` now logs `session_revocation.marker_write_failed` and returns False on a
+  Redis failure after the DB commit instead of raising a 500 (DB rows are authoritative).
+
 ## 0.5.2 (unreleased: no tag yet, the owner tags it)
 
 Permission client (`require_permission`, `check_permission`), containment layers C1-C4 of
