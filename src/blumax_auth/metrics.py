@@ -41,6 +41,9 @@ OUTCOMES = frozenset({
     "breaker_open",  # refused locally, Core not asked (circuit breaker open)
     "retried",       # a no-answer attempt is being asked once more (C3)
     "stale_served",  # an expired answer was served during an outage (C4)
+    "role_map_hit",       # 0.6.0: answered from the role -> codes map (token pv current); Core not asked
+    "role_map_fallback",  # 0.6.0: role map on but not usable for this request (old pv, no claims, Redis doubt...): asked the old way
+    "role_map_fetch",     # 0.6.0: one GET /identity/role-permissions (new grant version or new role set)
 })
 # Any other value passed in is counted as "unknown" so the label set stays closed.
 

@@ -105,6 +105,29 @@ C4  Bounded stale-on-error (`stale_grace_seconds`, default 0 = OFF, capped at 12
     a grant Core withdrew in the last TTL + grace seconds is still honoured during an
     outage: enabling it is an owner decision per service (OD-DEP-1).
 
+Role map (0.6.0, OFF unless role_map=True / BLUMAX_PERMISSION_ROLE_MAP=true)
+--------------------------------------------------------------------------
+Core (PERMISSION_VERSION_CLAIMS_ENABLED) can put two more claims in an access token: `rid`, the caller's role ids, and `pv`, its
+tenant's permission version. Database triggers in Core bump that version on EVERY write that can change who holds which role (membership
+created / removed / role changed / deactivated, additional role granted / removed, user deactivated or forced to change password, tenant
+suspended), and a separate global grants version on every role-permission write. Core copies both to Redis (sorted set
+`role:perms:ver`, member = tenant id / "grants") about once a second.
+
+With the switch on, a check for a token that carries both claims goes:
+  1. session not revoked: session_revocation's Redis check (exempt jti / marker), reused <= version_cache_seconds. Revoked, Redis
+     unavailable or a malformed marker -> ask Core (which answers 401 for a revoked session).
+  2. ZMSCORE role:perms:ver <tenant> grants, reused per tenant for <= version_cache_seconds (max 5 s).
+  3. token pv == the tenant's published pv, else ask Core (the token predates a membership change).
+  4. codes for each role in `rid` from a per-process map keyed (tenant, grants version), fetched from Core's
+     GET /api/v1/identity/role-permissions (with the caller's own token, If-None-Match) once per new grants version / new role; Core also
+     returns the database's current pv, and a mismatch there means "ask Core".
+  5. union of those codes -> the same allow / deny the old path gives.
+Any other outcome -- claims missing or malformed, a service token, session revocation not configured, Redis down or refusing (ACL),
+a version missing, an unknown role, Core's endpoint failing -- is a FALLBACK to the old path above (C1-C4 unchanged), never a grant.
+Platform admins pass before any of this, as before. A revoked role / membership / grant therefore stops working within Core's publish
+interval (~1 s) + version_cache_seconds (<= 5 s), even for a token minted before the change. Needs configure_session_revocation():
+that is the shared Redis the versions are read from. Counters: role_map_hit / role_map_fallback / role_map_fetch.
+
 Counters (optional): `blumax_core_permission_calls_total{outcome}` when the process
 has BLUMAX_METRICS_ENABLED=true and prometheus_client installed; see metrics.py.
 """
@@ -113,6 +136,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import time
 import uuid
 from collections import OrderedDict
@@ -136,6 +160,15 @@ PERMISSIONS_PATH = "/api/v1/me/permissions"
 
 #: Hard upper bound for C4's grace (a larger configured value is clamped to it).
 MAX_STALE_GRACE_SECONDS = 120.0
+
+#: 0.6.0 role map: Core's role -> codes endpoint, the Redis sorted set Core publishes the versions to, and its grants member.
+ROLE_PERMISSIONS_PATH = "/api/v1/identity/role-permissions"
+VERSIONS_KEY = "role:perms:ver"
+GRANTS_MEMBER = "grants"
+#: Upper bound for how long a tenant's published versions are reused (the revocation window on top of Core's ~1 s publish).
+MAX_VERSION_CACHE_SECONDS = 5.0
+#: Environment switch read when configure_permissions(role_map=None).
+ROLE_MAP_ENV = "BLUMAX_PERMISSION_ROLE_MAP"
 
 Mode = Literal["enforce", "warn"]
 _CacheKey = tuple[uuid.UUID, uuid.UUID, str]
@@ -187,6 +220,8 @@ class _Checker:
         retry_on_no_answer: bool = False,
         retry_pause_seconds: float = 0.15,
         stale_grace_seconds: float = 0.0,
+        role_map: bool = False,
+        version_cache_seconds: float = MAX_VERSION_CACHE_SECONDS,
     ) -> None:
         self._core_url = core_url.rstrip("/")
         self._ttl = ttl_seconds
@@ -212,6 +247,19 @@ class _Checker:
         # are always at the front and eviction is a cheap popitem.
         self._cache: OrderedDict[_CacheKey, tuple[float, frozenset[str]]] = OrderedDict()
         self._inflight: dict[_CacheKey, asyncio.Task[_Fetched]] = {}
+        # 0.6.0 role map (off unless role_map=True). See "Role map" in the module docstring.
+        self._role_map = role_map
+        self._version_ttl = min(max(0.0, version_cache_seconds), MAX_VERSION_CACHE_SECONDS)
+        # tenant -> (expires_at, tenant pv, grants gv); a failed read is never stored.
+        self._versions: dict[uuid.UUID, tuple[float, int, int]] = {}
+        self._versions_inflight: dict[uuid.UUID, asyncio.Task[tuple[int, int] | None]] = {}
+        # (tenant, gv) -> {role id: codes}. Only the newest gv per tenant is kept.
+        self._role_codes: OrderedDict[tuple[uuid.UUID, int], dict[uuid.UUID, frozenset[str]]] = OrderedDict()
+        # (tenant, role set) -> (etag, {role id: codes}) of the last 200, for If-None-Match.
+        self._role_etags: OrderedDict[tuple[uuid.UUID, tuple[uuid.UUID, ...]], tuple[str, dict[uuid.UUID, frozenset[str]]]] = OrderedDict()
+        self._map_inflight: dict[tuple[uuid.UUID, int, tuple[uuid.UUID, ...]], asyncio.Task[dict[uuid.UUID, frozenset[str]] | None]] = {}
+        # (user, jti) -> expires_at: "this session was not revoked" as read from Redis, reused for at most the version TTL.
+        self._not_revoked: OrderedDict[tuple[uuid.UUID, str], float] = OrderedDict()
 
     # ── public ────────────────────────────────────────────────────────────────
 
@@ -221,6 +269,10 @@ class _Checker:
         allow_stale=False (routes marked admin) never takes C4's stale answer.
         """
         assert ctx.tenant_id is not None  # require_tenant() guarantees it
+        if self._role_map:
+            mapped = await self._from_role_map(ctx, token)
+            if mapped is not None:
+                return mapped
         key: _CacheKey = (ctx.tenant_id, ctx.user_id, hashlib.sha256(token.encode()).hexdigest())
 
         hit = self._lookup(key)
@@ -263,6 +315,223 @@ class _Checker:
     def clear(self) -> None:
         self._cache.clear()
         self._last_good.clear()
+        self._versions.clear()
+        self._role_codes.clear()
+        self._role_etags.clear()
+        self._not_revoked.clear()
+
+    # ── 0.6.0 role map ────────────────────────────────────────────────────────
+
+    async def _from_role_map(self, ctx: AuthContext, token: str) -> _Answer | None:
+        """The caller's codes from the role -> codes map, or None = "not usable for this request, ask Core the old way".
+
+        Every step that is not a clear yes returns None; nothing here ever raises into the request and nothing here ever grants
+        what Core's own answer would not. Steps: claims present -> session not revoked (Redis) -> token pv == the tenant's
+        published pv (Redis, <= version TTL old) -> every role of the token in the map for the current grants version (fetched
+        from Core once per version) -> union."""
+        reason = await self._role_map_reason(ctx)
+        if reason is not None:
+            return self._fallback(ctx, reason)
+        assert ctx.tenant_id is not None and ctx.role_ids is not None
+        try:
+            versions = await self._tenant_versions(ctx.tenant_id)
+        except Exception:  # noqa: BLE001 - any doubt is a fallback
+            versions = None
+        if versions is None:
+            return self._fallback(ctx, "versions_unavailable")
+        pv, gv = versions
+        if ctx.roles_version != pv:
+            return self._fallback(ctx, "pv_mismatch")
+        known = self._role_codes.get((ctx.tenant_id, gv), {})
+        missing = tuple(r for r in ctx.role_ids if r not in known)
+        fetched = False
+        if missing:
+            try:
+                got = await self._role_codes_from_core(ctx.tenant_id, gv, ctx.role_ids, token, pv)
+            except Exception:  # noqa: BLE001
+                got = None
+            if got is None:
+                return self._fallback(ctx, "role_map_unavailable")
+            known = got
+            fetched = True
+        if any(r not in known for r in ctx.role_ids):
+            return self._fallback(ctx, "unknown_role")
+        codes: set[str] = set()
+        for role_id in ctx.role_ids:
+            codes |= known[role_id]
+        _count("role_map_hit")
+        return _Answer(codes=frozenset(codes), cached=not fetched)
+
+    async def _role_map_reason(self, ctx: AuthContext) -> str | None:
+        """Why this request cannot use the role map (None = it may, so far)."""
+        if ctx.role_ids is None or ctx.roles_version is None or ctx.is_service:
+            return "no_claims"
+        from blumax_auth import (
+            session_revocation,  # noqa: PLC0415 - avoids an import cycle at module load
+        )
+
+        revocation = session_revocation._checker
+        if revocation is None:
+            # The shared Redis is how both the versions and the revocation markers are read. Without it, Core's own answer is the
+            # only one that also covers a logged-out session, so ask Core.
+            return "no_redis"
+        if ctx.jti is None or ctx.issued_at is None:
+            return "no_session_identity"
+        key = (ctx.user_id, ctx.jti)
+        now = self._clock()
+        until = self._not_revoked.get(key)
+        if until is not None and now < until:
+            return None
+        try:
+            revoked, ambiguous, _ = await revocation.is_revoked(ctx.user_id, ctx.issued_at, ctx.jti)
+        except Exception:  # noqa: BLE001
+            return "revocation_unavailable"
+        if revoked:
+            return "session_revoked"          # Core will answer 401 on the old path
+        if ambiguous is not None:
+            return "revocation_unavailable"   # Redis down / marker malformed: never treated as "not revoked" here
+        if self._version_ttl > 0:
+            self._not_revoked[key] = now + self._version_ttl
+            self._not_revoked.move_to_end(key)
+            while len(self._not_revoked) > self._max:
+                self._not_revoked.popitem(last=False)
+        return None
+
+    def _fallback(self, ctx: AuthContext, reason: str) -> None:
+        _count("role_map_fallback")
+        _log.debug("permission_role_map_fallback", extra={"reason": reason, "tenant_id": str(ctx.tenant_id)})
+        return None
+
+    async def _tenant_versions(self, tenant_id: uuid.UUID) -> tuple[int, int] | None:
+        """(tenant pv, grants gv) as Core last published them, reused for at most the version TTL. None on any doubt."""
+        entry = self._versions.get(tenant_id)
+        if entry is not None and self._clock() < entry[0]:
+            return entry[1], entry[2]
+        task = self._versions_inflight.get(tenant_id)
+        if task is None:
+            task = asyncio.ensure_future(self._read_versions(tenant_id))
+            self._versions_inflight[tenant_id] = task
+
+            def _done(t: asyncio.Task, k: uuid.UUID = tenant_id) -> None:
+                if self._versions_inflight.get(k) is t:
+                    del self._versions_inflight[k]
+                if not t.cancelled():
+                    t.exception()
+
+            task.add_done_callback(_done)
+        return await asyncio.shield(task)
+
+    async def _read_versions(self, tenant_id: uuid.UUID) -> tuple[int, int] | None:
+        from blumax_auth import session_revocation  # noqa: PLC0415
+
+        revocation = session_revocation._checker
+        if revocation is None:
+            return None
+        try:
+            scores = await asyncio.wait_for(
+                revocation.redis.zmscore(VERSIONS_KEY, [str(tenant_id), GRANTS_MEMBER]), session_revocation._redis_timeout(),
+            )
+        except Exception:  # noqa: BLE001 - Redis down, ACL refusal, timeout: ask Core
+            _log.warning("permission_role_map_versions_unavailable", extra={"tenant_id": str(tenant_id)})
+            return None
+        if not scores or len(scores) != 2 or scores[0] is None or scores[1] is None:
+            return None
+        try:
+            pv, gv = int(scores[0]), int(scores[1])
+        except (TypeError, ValueError):
+            return None
+        if self._version_ttl > 0:
+            self._versions[tenant_id] = (self._clock() + self._version_ttl, pv, gv)
+            if len(self._versions) > self._max:
+                self._versions.pop(next(iter(self._versions)))
+        return pv, gv
+
+    async def _role_codes_from_core(
+        self, tenant_id: uuid.UUID, gv: int, role_ids: tuple[uuid.UUID, ...], token: str, pv: int,
+    ) -> dict[uuid.UUID, frozenset[str]] | None:
+        """Fetch codes for `role_ids` (single-flight per tenant + version + role set) and merge them into the map for (tenant, gv).
+        Returns the merged map, or None (not stored) on any doubt."""
+        fkey = (tenant_id, gv, role_ids)
+        task = self._map_inflight.get(fkey)
+        if task is None:
+            task = asyncio.ensure_future(self._fetch_role_codes(tenant_id, gv, role_ids, token, pv))
+            self._map_inflight[fkey] = task
+
+            def _done(t: asyncio.Task, k=fkey) -> None:
+                if self._map_inflight.get(k) is t:
+                    del self._map_inflight[k]
+                if not t.cancelled():
+                    t.exception()
+
+            task.add_done_callback(_done)
+        return await asyncio.shield(task)
+
+    async def _fetch_role_codes(
+        self, tenant_id: uuid.UUID, gv: int, role_ids: tuple[uuid.UUID, ...], token: str, pv: int,
+    ) -> dict[uuid.UUID, frozenset[str]] | None:
+        _count("role_map_fetch")
+        ekey = (tenant_id, role_ids)
+        previous = self._role_etags.get(ekey)
+        headers = {
+            # The caller's OWN token: Core lets a user token ask only about the roles its own `rid` names. Tenant = the signed claim.
+            "Authorization": f"Bearer {token}",
+            "X-Tenant-ID": str(tenant_id),
+            "Accept": "application/json",
+        }
+        if previous is not None:
+            headers["If-None-Match"] = previous[0]
+        resp = await self._http().get(ROLE_PERMISSIONS_PATH, params={"role_ids": ",".join(str(r) for r in role_ids)}, headers=headers)
+        try:
+            core_gv = int(resp.headers["X-Grant-Version"])
+            core_pv = int(resp.headers["X-Permission-Version"])
+        except (KeyError, ValueError):
+            return None
+        if resp.status_code == 304 and previous is not None:
+            roles = previous[1]
+        elif resp.status_code == 200:
+            try:
+                body = resp.json()
+                raw = body["roles"]
+                if not isinstance(raw, dict):
+                    return None
+                roles = {}
+                for rid, codes in raw.items():
+                    if not isinstance(codes, list) or not all(isinstance(c, str) for c in codes):
+                        return None
+                    roles[uuid.UUID(rid)] = frozenset(codes)
+            except (ValueError, KeyError, TypeError):
+                return None
+            etag = resp.headers.get("ETag")
+            if etag:
+                self._role_etags[ekey] = (etag, roles)
+                self._role_etags.move_to_end(ekey)
+                while len(self._role_etags) > self._max:
+                    self._role_etags.popitem(last=False)
+        else:
+            return None
+        # Core read these codes AFTER its versions, so they are at least as new as `core_gv`. Core's database being BEHIND what Redis
+        # said cannot happen in a sane deployment (Redis is a copy): treat it as doubt and keep nothing.
+        if core_gv < gv:
+            return None
+        if core_pv != pv:
+            # The database already moved past the token's version (Redis has not caught up yet): this token is out of date.
+            # The codes are still right for these roles, but the caller must not be answered from them.
+            self._merge_role_codes(tenant_id, gv, roles)
+            return None
+        return self._merge_role_codes(tenant_id, gv, roles)
+
+    def _merge_role_codes(
+        self, tenant_id: uuid.UUID, gv: int, roles: dict[uuid.UUID, frozenset[str]],
+    ) -> dict[uuid.UUID, frozenset[str]]:
+        key = (tenant_id, gv)
+        for old in [k for k in self._role_codes if k[0] == tenant_id and k[1] != gv]:
+            del self._role_codes[old]   # an older grants version of this tenant is never read again
+        merged = {**self._role_codes.get(key, {}), **roles}
+        self._role_codes[key] = merged
+        self._role_codes.move_to_end(key)
+        while len(self._role_codes) > self._max:
+            self._role_codes.popitem(last=False)
+        return merged
 
     # ── cache ─────────────────────────────────────────────────────────────────
 
@@ -449,6 +718,8 @@ def configure_permissions(
     retry_on_no_answer: bool = True,
     retry_pause_seconds: float = 0.15,
     stale_grace_seconds: float = 0.0,
+    role_map: bool | None = None,
+    version_cache_seconds: float = MAX_VERSION_CACHE_SECONDS,
 ) -> None:
     """Point this service at Core for permission checks. Call once, at startup.
 
@@ -467,6 +738,11 @@ def configure_permissions(
                         caller key for up to this many seconds past its TTL. 0 (default) = off. Capped at MAX_STALE_GRACE_SECONDS (120);
                         a larger value is clamped with a warning. Needs ttl_seconds > 0. Never on routes marked admin=True.
                         Services read it from PERMISSION_CHECK_STALE_GRACE_SECONDS; enabling it is an owner decision (OD-DEP-1).
+    role_map        0.6.0: resolve a token's `rid` + `pv` from a per-process role -> codes map instead of asking Core per caller
+                    (see "Role map" in the module docstring). None (default) = read env BLUMAX_PERMISSION_ROLE_MAP ("true"/"1"/"on");
+                    unset = OFF, exactly 0.5.2's behaviour. Needs configure_session_revocation() (the shared Redis); without it every
+                    request simply takes the old path.
+    version_cache_seconds  How long a tenant's published versions are reused (default and maximum 5; larger is clamped).
     """
     global _checker
     if not core_url or not core_url.strip():
@@ -488,6 +764,10 @@ def configure_permissions(
             "permission_stale_grace_clamped",
             extra={"configured": stale_grace_seconds, "max": MAX_STALE_GRACE_SECONDS},
         )
+    if role_map is None:
+        role_map = os.environ.get(ROLE_MAP_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+    if version_cache_seconds < 0:
+        raise ValueError("version_cache_seconds must be >= 0")
     _checker = _Checker(
         core_url=core_url,
         ttl_seconds=ttl_seconds,
@@ -500,7 +780,11 @@ def configure_permissions(
         retry_on_no_answer=retry_on_no_answer,
         retry_pause_seconds=retry_pause_seconds,
         stale_grace_seconds=stale_grace_seconds,
+        role_map=role_map,
+        version_cache_seconds=version_cache_seconds,
     )
+    if role_map:
+        _log.info("permission_role_map_enabled", extra={"version_cache_seconds": min(version_cache_seconds, MAX_VERSION_CACHE_SECONDS)})
 
 
 async def aclose_permissions() -> None:

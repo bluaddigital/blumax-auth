@@ -2,6 +2,22 @@
 
 Started with 0.5.2; earlier releases are described in their tag commits (`git log v0.5.1`).
 
+## 0.6.0 (proposed; unreleased, no tag: the owner tags it. Contains everything in 0.5.2.)
+
+Role map for permission checks, **OFF by default** (`configure_permissions(role_map=...)`, or env `BLUMAX_PERMISSION_ROLE_MAP=true`
+when the argument is left at None). With it off, behaviour is 0.5.2's exactly.
+
+- `AuthContext` gains `role_ids` (token claim `rid`) and `roles_version` (claim `pv`), both None unless the token carries both,
+  well-formed. Only the permission checker reads them.
+- When on, and the token carries both, and `configure_session_revocation()` gave this process the shared Redis: the session is
+  checked against the revocation markers, the tenant's published versions are read (`ZMSCORE role:perms:ver <tenant> grants`,
+  reused <= 5 s), and when the token's `pv` equals the tenant's, the codes come from a per-process role -> codes map fetched once
+  per grants version from Core's `GET /api/v1/identity/role-permissions` (caller's own token, If-None-Match). Anything else falls
+  back to the 0.5.2 path (`GET /api/v1/me/permissions`); never a grant on doubt. See "Role map" in `permissions.py`.
+- Counter outcomes `role_map_hit`, `role_map_fallback`, `role_map_fetch`.
+- Needs Core with `PERMISSION_VERSION_CLAIMS_ENABLED=true` (blumax-backend migration 231 + the claims / publisher / endpoint).
+  Rollout: [docs/ROLE_MAP_ROLLOUT.md](docs/ROLE_MAP_ROLLOUT.md).
+
 ## 0.5.2 (unreleased: no tag yet, the owner tags it)
 
 Permission client (`require_permission`, `check_permission`), containment layers C1-C4 of

@@ -68,6 +68,12 @@ class AuthContext:
     # The full grant the token carried in "fac" before it was narrowed (None = unrestricted). Only for code that must
     # know what the user MAY switch to; never use it to authorize data access.
     assigned_facility_ids: frozenset[uuid.UUID] | None = None
+    # Role-map permission checks (0.6.0, permissions.py): the caller's role ids ("rid", sorted) and the tenant permission version they were
+    # read under ("pv"). Both None for a token that carries neither (every token Core minted before the switch, service tokens, platform
+    # admins) or carries them malformed. ONLY the permission checker reads them, and only after checking `pv` against the version Core
+    # publishes; never authorize anything from them directly.
+    role_ids: tuple[uuid.UUID, ...] | None = None
+    roles_version: int | None = None
 
     @property
     def is_facility_bound(self) -> bool:

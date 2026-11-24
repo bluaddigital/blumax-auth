@@ -190,4 +190,18 @@ def _to_context(claims: dict[str, Any], *, is_service: bool) -> AuthContext:
         issued_at=_issued_at(claims),
         active_facility_id=active_facility_id,
         assigned_facility_ids=assigned_facility_ids,
+        **_role_version(claims),
     )
+
+
+def _role_version(claims: dict[str, Any]) -> dict[str, Any]:
+    """"rid" + "pv" as AuthContext fields: both well-formed or both None. Malformed claims are ignored, never an error -- they only ever
+    make the permission check take its ordinary path (ask Core)."""
+    raw_rid, raw_pv = claims.get("rid"), claims.get("pv")
+    if not isinstance(raw_rid, list) or not raw_rid or not isinstance(raw_pv, int) or isinstance(raw_pv, bool):
+        return {"role_ids": None, "roles_version": None}
+    try:
+        role_ids = tuple(sorted({uuid.UUID(str(r)) for r in raw_rid}, key=str))
+    except (TypeError, ValueError):
+        return {"role_ids": None, "roles_version": None}
+    return {"role_ids": role_ids, "roles_version": raw_pv}
