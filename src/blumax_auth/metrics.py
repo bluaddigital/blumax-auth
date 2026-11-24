@@ -44,10 +44,26 @@ OUTCOMES = frozenset({
 })
 # Any other value passed in is counted as "unknown" so the label set stays closed.
 
+SESSION_REVOCATION = "blumax_session_revocation_total"
+
+#: Every `outcome` label value of the session-revocation check (fixed and small, like OUTCOMES).
+SESSION_OUTCOMES = frozenset({
+    "cache_hit",             # answered from this process's session-status cache; the store was not asked
+    "cache_miss",            # cache on, no usable entry: a store read follows (shared by concurrent callers)
+    "store_reads",           # one real round trip to the revocation store
+    "store_unavailable",     # revocation_store_unavailable: the store did not answer (timeout/error/breaker open)
+    "stale_read_served",     # split mode: a safe read passed on the last known status inside the stale window
+    "rejected_unavailable",  # split mode: refused with 503 because the store is unavailable
+    "revoked",               # a revoked session was refused
+})
+
 _lock = threading.Lock()
 _tally: _Tally[str] = _Tally()
 _prom: Any = None          # the prometheus Counter, once resolved
 _resolved = False
+_session_tally: _Tally[str] = _Tally()
+_session_prom: Any = None
+_session_resolved = False
 
 
 def _enabled() -> bool:
@@ -90,6 +106,47 @@ def core_permission_call(outcome: str) -> None:
         _log.exception("metrics_increment_failed")
 
 
+def _prometheus_session_counter() -> Any:
+    global _session_prom, _session_resolved
+    if _session_resolved:
+        return _session_prom
+    with _lock:
+        if _session_resolved:
+            return _session_prom
+        if _enabled():
+            try:
+                from prometheus_client import Counter  # noqa: PLC0415 - optional dependency
+            except ImportError:
+                _log.warning("metrics_unavailable", extra={"reason": "prometheus_client not installed", "flag": ENV_FLAG})
+            else:
+                try:
+                    _session_prom = Counter(SESSION_REVOCATION, "Outcomes of blumax-auth session-revocation checks", ["outcome"])
+                except ValueError:  # already registered (module reloaded in the same process)
+                    from prometheus_client import REGISTRY  # noqa: PLC0415
+
+                    _session_prom = REGISTRY._names_to_collectors.get(SESSION_REVOCATION)  # type: ignore[attr-defined]
+        _session_resolved = True
+    return _session_prom
+
+
+def session_revocation_event(outcome: str) -> None:
+    """Count one session-revocation outcome (see SESSION_OUTCOMES). Never raises."""
+    if outcome not in SESSION_OUTCOMES:
+        outcome = "unknown"
+    try:
+        _session_tally[outcome] += 1
+        counter = _prometheus_session_counter()
+        if counter is not None:
+            counter.labels(outcome=outcome).inc()
+    except Exception:  # pragma: no cover - metrics must never break a check
+        _log.exception("metrics_increment_failed")
+
+
+def session_snapshot() -> dict[str, int]:
+    """This process's session-revocation counts per outcome (independent of the Prometheus flag)."""
+    return dict(_session_tally)
+
+
 def snapshot() -> dict[str, int]:
     """This process's counts per outcome (independent of the Prometheus flag)."""
     return dict(_tally)
@@ -97,8 +154,11 @@ def snapshot() -> dict[str, int]:
 
 def reset_metrics() -> None:
     """Forget counts and re-read the flag on next use. Tests only."""
-    global _prom, _resolved
+    global _prom, _resolved, _session_prom, _session_resolved
     with _lock:
         _tally.clear()
+        _session_tally.clear()
         _prom = None
         _resolved = False
+        _session_prom = None
+        _session_resolved = False

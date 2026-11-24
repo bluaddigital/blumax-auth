@@ -19,6 +19,7 @@ from blumax_auth.errors import (
     MissingCredentials,
     PatientSessionInactive,
     SessionCheckUnavailable,
+    SessionRevocationUnavailable,
     TenantContextMissing,
     TenantMismatch,
 )
@@ -65,6 +66,7 @@ from blumax_auth.session_revocation import (
     check_session_revocation,
     configure_session_revocation,
     reset_session_revocation,
+    session_revocation_check,
 )
 from blumax_auth.verify import MultiIssuerTokenVerifier, TokenVerifier
 
@@ -86,6 +88,7 @@ __all__ = [
     "PatientSessionInactive",
     "PatientTokenVerifier",
     "SessionCheckUnavailable",
+    "SessionRevocationUnavailable",
     "PermissionCheckUnavailable",
     "TenantAuth",
     "TenantContextMissing",
@@ -117,5 +120,6 @@ __all__ = [
     "reset_patients",
     "reset_permissions",
     "reset_session_revocation",
+    "session_revocation_check",
     "verifier",
 ]

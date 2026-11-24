@@ -7,10 +7,16 @@ from __future__ import annotations
 
 import uuid
 
+import structlog
+from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.session_revocation import revoke_user_sessions
 from app.models.user import User
+from app.services.auth_service import revoke_all_refresh_tokens_stmt
+
+logger = structlog.get_logger(__name__)
 
 
 class UserSyncConflictError(Exception):
@@ -35,6 +41,7 @@ async def sync_user_from_core(
     username: str | None,
     hashed_password: str,
     is_active: bool | None,
+    redis: Redis | None = None,
 ) -> None:
     """Upsert by user_id -- Core's own id is preserved exactly (see
     migrate_core_user.py's module docstring for why this matters: every
@@ -45,7 +52,13 @@ async def sync_user_from_core(
     untouched on an existing row, and a password-changed event for a
     user_id this table has never seen is a no-op (there is nothing to
     create from a bare password alone; the next user.created-shaped sync,
-    if one ever arrives, creates it properly)."""
+    if one ever arrives, creates it properly).
+
+    Deactivation (`is_active=False`, audit D-6): the user's refresh rows are revoked in the same transaction as
+    the flag, and the Redis marker is written afterwards so access tokens already issued stop working. This runs
+    on EVERY event that carries is_active=False, not only on the True->False transition, so a relay retry after a
+    failed marker write repairs the marker (both steps are idempotent). `redis` is optional only so older callers
+    keep working; without it the refresh rows are still revoked and an error is logged for the missing marker."""
     existing = await db.get(User, user_id)
 
     if existing is None:
@@ -74,4 +87,13 @@ async def sync_user_from_core(
     existing.hashed_password = hashed_password
     if is_active is not None:
         existing.is_active = is_active
+    deactivating = is_active is False
+    if deactivating:
+        await db.execute(revoke_all_refresh_tokens_stmt(user_id))
     await db.commit()
+    if deactivating:
+        if redis is None:
+            logger.error("user_sync.deactivation_marker_not_written", user_id=str(user_id), reason="no_redis")
+        else:
+            await revoke_user_sessions(redis, str(user_id))
+        logger.info("user_sync.deactivated", user_id=str(user_id))
