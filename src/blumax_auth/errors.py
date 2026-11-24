@@ -15,6 +15,8 @@ class AuthError(Exception):
     status_code: int = 401
     error_code: str = "AUTHENTICATION_FAILED"
     message: str = "Authentication required"
+    #: Extra response headers the error handler should send (e.g. ``Retry-After`` on a 503). None = none.
+    headers: dict[str, str] | None = None
 
     def __init__(self, message: str | None = None) -> None:
         super().__init__(message or self.message)
@@ -92,3 +94,14 @@ class SessionCheckUnavailable(AuthError):
     status_code = 503
     error_code = "SESSION_CHECK_UNAVAILABLE"
     message = "Session verification is temporarily unavailable"
+
+
+class SessionRevocationUnavailable(SessionCheckUnavailable):
+    """The session-revocation store could not be asked and the policy for this request is to fail closed.
+
+    503 + ``Retry-After`` (see ``headers``), raised only under ``fail_mode="split"``: for a write, a route marked
+    sensitive/admin, or a read once the bounded stale window has passed. The credentials may be fine; the service
+    just cannot prove the session is still valid, and "store unavailable" is never read as "session valid" here.
+    """
+
+    message = "Session revocation status could not be verified right now; retry shortly"

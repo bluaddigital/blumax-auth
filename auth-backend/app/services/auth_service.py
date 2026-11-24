@@ -15,6 +15,7 @@ from redis.asyncio import Redis
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.security import (
     InvalidToken,
     create_access_token,
@@ -123,7 +124,7 @@ async def login(
 
     refresh_row = RefreshToken(
         user_id=user.id,
-        expires_at=datetime.now(UTC) + timedelta(days=14),
+        expires_at=datetime.now(UTC) + _refresh_lifetime(),
         user_agent=user_agent, ip_address=ip_address,
     )
     db.add(refresh_row)
@@ -176,7 +177,7 @@ async def mint_for_verified_identity(
 
     refresh_row = RefreshToken(
         user_id=user.id,
-        expires_at=datetime.now(UTC) + timedelta(days=14),
+        expires_at=datetime.now(UTC) + _refresh_lifetime(),
         user_agent=user_agent, ip_address=ip_address,
     )
     db.add(refresh_row)
@@ -189,6 +190,22 @@ async def mint_for_verified_identity(
         user_id=str(user.id), tenant_id=str(tenant_id) if tenant_id else None,
     )
     return access_token, refresh_token
+
+
+def _refresh_lifetime() -> timedelta:
+    """Refresh-row lifetime: the configured REFRESH_TOKEN_EXPIRE_DAYS (default 14), the same value the refresh
+    JWT's own `exp` uses, so the row and the token cannot disagree."""
+    return timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+
+
+def revoke_all_refresh_tokens_stmt(user_id: uuid.UUID):
+    """UPDATE that revokes every live refresh row of a user. The caller executes it in its own transaction (so a
+    password change and the revocation commit together) and then writes the Redis marker for access tokens."""
+    return (
+        RefreshToken.__table__.update()
+        .where(RefreshToken.user_id == user_id, RefreshToken.revoked.is_(False))
+        .values(revoked=True)
+    )
 
 
 async def refresh(
@@ -258,11 +275,20 @@ async def refresh(
         logger.info("refresh.failed", reason="expired", jti=str(token_id))
         raise AuthenticationError("Refresh token expired")
 
+    # An account that was deactivated (or removed) after this token was issued must not keep minting access
+    # tokens (audit D-6). Its whole refresh family is ended, durably, in the same transaction.
+    user = await db.get(User, row.user_id)
+    if user is None or not user.is_active:
+        await db.execute(revoke_all_refresh_tokens_stmt(row.user_id))
+        await db.commit()
+        logger.info("refresh.failed", reason="inactive_user", user_id=str(row.user_id), jti=str(token_id))
+        raise AuthenticationError("Account is deactivated")
+
     # Rotate: revoke this row, issue a brand-new one.
     row.revoked = True
     row.last_used_at = now
     new_row = RefreshToken(
-        user_id=row.user_id, expires_at=now + timedelta(days=14),
+        user_id=row.user_id, expires_at=now + _refresh_lifetime(),
         user_agent=row.user_agent, ip_address=row.ip_address,
     )
     db.add(new_row)

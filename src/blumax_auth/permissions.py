@@ -539,6 +539,11 @@ def require_permission(code: str, *, mode: Mode = "enforce", admin: bool = False
         ctx: Annotated[AuthContext, Depends(require_tenant)],
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)] = None,
     ) -> AuthContext:
+        if admin:
+            # Same notion, one more consumer: check_session_revocation treats an admin route as sensitive
+            # (fail_mode="split": fail closed, no cached status). Only seen by a revocation dependency that
+            # runs AFTER this one; use session_revocation_check(sensitive=True) for an order-independent mark.
+            request.state.blumax_sensitive_route = True
         if ctx.is_platform_admin:
             if mode == "warn":
                 _emit(request, ctx, code, decision="allow", reason="platform_admin", cached=False)

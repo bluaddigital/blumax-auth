@@ -2,6 +2,32 @@
 
 Started with 0.5.2; earlier releases are described in their tag commits (`git log v0.5.1`).
 
+## Unreleased (next version after 0.5.2: no tag, no version bump; the owner tags)
+
+Phase 0 security (JWT/SSO audit D-1, B2). Additive; every default is unchanged.
+
+- **`fail_mode="split"` for session revocation** (env `SESSION_REVOCATION_FAIL_MODE=split`; the library default stays
+  `"open"`, `"open"`/`"closed"` behave exactly as before). When the revocation store is unavailable in enforce mode:
+  writes (anything but GET/HEAD/OPTIONS), routes marked sensitive and exports/credential changes FAIL CLOSED with
+  `SessionRevocationUnavailable` (503 + `Retry-After`); safe reads keep using the last known status for at most
+  `SESSION_REVOCATION_STALE_READ_SECONDS` (default 300, clamped to 3600) counted from this process's last SUCCESSFUL
+  store check, then fail closed too. A session this process already saw revoked stays revoked. The 10 s breaker keeps
+  its job but no longer lets writes through in split mode. Mark a route sensitive with
+  `Depends(session_revocation_check(sensitive=True))` (order-independent) or by `require_permission(code, admin=True)`
+  running earlier in the request (it sets `request.state.blumax_sensitive_route`).
+- **Optional per-process session-status cache** `SESSION_STATUS_CACHE_SECONDS` (default 0 = off, exact old behaviour;
+  2-5 recommended), `SESSION_STATUS_CACHE_MAX_ENTRIES` (10000): keyed by (user, iat, jti), bounded LRU, single-flight,
+  expiry jittered 0-20 % short; "revoked" answers are kept 26 h; unavailable answers are never cached; sensitive routes
+  bypass it. A revocation is visible within the TTL.
+- **Counters** `blumax_session_revocation_total{outcome}` (Prometheus only when `BLUMAX_METRICS_ENABLED=true`) and
+  `blumax_auth.metrics.session_snapshot()`: `cache_hit`, `cache_miss`, `store_reads`, `store_unavailable`,
+  `stale_read_served`, `rejected_unavailable`, `revoked`. Rate-limited WARNING `revocation_store_unavailable` with
+  outcome, fail_mode, method, sensitive, stale_age_seconds.
+- `AuthError.headers` (optional response headers) and `install_error_handler` sends them; **a service with its own
+  AuthError renderer must pass `exc.headers` through or the 503 loses `Retry-After`** (status and body are unaffected).
+- New exports: `SessionRevocationUnavailable`, `session_revocation_check`. `check_session_revocation` gained an
+  optional `request` parameter (injected by FastAPI; a direct call without it is treated as a write under split).
+
 ## 0.5.2 (unreleased: no tag yet, the owner tags it)
 
 Permission client (`require_permission`, `check_permission`), containment layers C1-C4 of

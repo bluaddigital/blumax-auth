@@ -300,6 +300,7 @@ def install_error_handler(app: object, renderer: Callable[[AuthError], object] |
                     "details": {},
                 }
             },
+            headers=getattr(exc, "headers", None),
         )
 
     app.add_exception_handler(AuthError, _handler)  # type: ignore[attr-defined]
