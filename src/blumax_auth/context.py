@@ -68,6 +68,10 @@ class AuthContext:
     # The full grant the token carried in "fac" before it was narrowed (None = unrestricted). Only for code that must
     # know what the user MAY switch to; never use it to authorize data access.
     assigned_facility_ids: frozenset[uuid.UUID] | None = None
+    # The v2 `sid` claim: the Core refresh-token family (login session) this token belongs to; SSO child sessions share
+    # their source session's sid. None for v1 tokens, service tokens and a malformed claim. Used only by
+    # session_revocation.py to honour Core's per-session marker (Phase 5b); never an authorization input.
+    session_id: uuid.UUID | None = None
 
     @property
     def is_facility_bound(self) -> bool:

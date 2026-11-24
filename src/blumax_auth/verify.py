@@ -187,6 +187,15 @@ def _uuid(claims: dict[str, Any], name: str) -> uuid.UUID | None:
         raise InvalidToken(f"Token claim {name!r} is not a valid UUID") from exc
 
 
+def _optional_uuid(claims: dict[str, Any], name: str) -> uuid.UUID | None:
+    """Like _uuid, but a malformed value reads as absent instead of failing verification (for informational claims
+    whose absence must never change whether a token verifies)."""
+    try:
+        return _uuid(claims, name)
+    except InvalidToken:
+        return None
+
+
 def _to_context(claims: dict[str, Any], *, is_service: bool) -> AuthContext:
     user_id = _uuid(claims, "sub")
     if user_id is None:
@@ -226,4 +235,5 @@ def _to_context(claims: dict[str, Any], *, is_service: bool) -> AuthContext:
         issued_at=_issued_at(claims),
         active_facility_id=active_facility_id,
         assigned_facility_ids=assigned_facility_ids,
+        session_id=_optional_uuid(claims, "sid"),
     )

@@ -133,6 +133,14 @@ already saw revoked is refused (401) whenever the store cannot answer, in every 
 answer is NEVER cached; it follows the fail_mode policy. Sensitive routes bypass the cache (fresh read) and, under
 fail_mode="split", fail closed when a fresh status cannot be established. Counters: cache_hit, cache_miss, store_reads.
 
+Per-session marker (0.6.2, Phase 5b)
+------------------------------------
+A token carrying a v2 `sid` also has `session_revoked_sid:{sid}` read, in the SAME MGET (one round trip). Core writes
+it (switch SSO_SID_REVOCATION=on) when ONE session -- a refresh family, plus its SSO child sessions, which share the
+sid -- is logged out, so those access tokens end at once while the user's other devices keep working. Same strict
+`issued_at <= marker` comparison, same fail modes, same cache rules; checked before the jti exemption. Absent key or
+no `sid` on the token: nothing changes.
+
 Rollout mode
 ------------
 `mode="warn"` (the default, service-wide, set at configure_session_revocation
@@ -301,6 +309,13 @@ def _key(user_id: object) -> str:
     return f"session_revoked_at:{user_id}"
 
 
+def _sid_key(session_id: object) -> str:
+    # Same format Core writes (Phase 5b, SSO_SID_REVOCATION=on): f"session_revoked_sid:{sid}" -- an ISO timestamp
+    # written when ONE refresh family is logged out (and with it its SSO child sessions, which share the family's sid).
+    # Absent unless Core's switch is on, so reading it is a no-op by default.
+    return f"session_revoked_sid:{session_id}"
+
+
 def _exempt_key(user_id: object, jti: str) -> str:
     # Same format Core writes: f"session_revoked_at:{user_id}:exempt:{jti}"
     # (app/core/session_revocation.py::_exempt_key), written once by
@@ -371,7 +386,8 @@ class _Checker:
         return True, entry[1]
 
     async def lookup(
-        self, user_id: object, issued_at: datetime | None, jti: str | None, *, fresh: bool = False
+        self, user_id: object, issued_at: datetime | None, jti: str | None, *, fresh: bool = False,
+        session_id: object | None = None,
     ) -> tuple[bool, str | None, datetime | None]:
         """is_revoked() through the optional cache. Same return shape.
 
@@ -381,7 +397,7 @@ class _Checker:
         malformed answer (reason set) is returned to the caller for the fail_mode policy and never stored.
         """
         if self.cache_seconds <= 0 or issued_at is None:
-            return await self.is_revoked(user_id, issued_at, jti)
+            return await self.is_revoked(user_id, issued_at, jti, session_id=session_id)
         key = self._cache_key(user_id, issued_at, jti)
         if not fresh:
             now = _clock()
@@ -397,25 +413,25 @@ class _Checker:
             _metrics.session_revocation_event("cache_miss")
             task = self._inflight.get(key)
             if task is None:
-                task = asyncio.ensure_future(self._read_and_remember(key, user_id, issued_at, jti))
+                task = asyncio.ensure_future(self._read_and_remember(key, user_id, issued_at, jti, session_id))
                 self._inflight[key] = task
                 task.add_done_callback(lambda _t, k=key: self._inflight.pop(k, None))
             # shield: one waiter being cancelled (client disconnect) must not cancel the read the others share
             return await asyncio.shield(task)
         _metrics.session_revocation_event("cache_miss")
-        return await self._read_and_remember(key, user_id, issued_at, jti)
+        return await self._read_and_remember(key, user_id, issued_at, jti, session_id)
 
     async def _read_and_remember(
-        self, key: tuple, user_id: object, issued_at: datetime, jti: str | None
+        self, key: tuple, user_id: object, issued_at: datetime, jti: str | None, session_id: object | None = None
     ) -> tuple[bool, str | None, datetime | None]:
-        result = await self.is_revoked(user_id, issued_at, jti)
+        result = await self.is_revoked(user_id, issued_at, jti, session_id=session_id)
         revoked, reason, revoked_at = result
         if reason is None:
             self._remember(key, revoked, revoked_at)
         return result
 
     async def is_revoked(
-        self, user_id: object, issued_at: datetime | None, jti: str | None
+        self, user_id: object, issued_at: datetime | None, jti: str | None, *, session_id: object | None = None
     ) -> tuple[bool, str | None, datetime | None]:
         """Returns (revoked, reason_if_ambiguous, revoked_at_if_known).
 
@@ -437,6 +453,10 @@ class _Checker:
         # (a test double) is asked key by key; the first failure ends the check either way, so a hung Redis costs
         # one timeout per request, never two.
         keys = [_exempt_key(user_id, jti), _key(user_id)] if jti is not None else [_key(user_id)]
+        # Phase 5b: a token carrying a v2 `sid` also asks for its session's own marker, in the SAME MGET (one round
+        # trip, one timeout, same fail-mode handling). A token without a sid reads exactly the keys it read before.
+        if session_id is not None:
+            keys.append(_sid_key(session_id))
         _metrics.session_revocation_event("store_reads")
         try:
             mget = getattr(self.redis, "mget", None)
@@ -449,6 +469,19 @@ class _Checker:
             _log.warning("session_revocation_check_unavailable", extra={"user_id": str(user_id)})
             return False, "redis_unavailable", None
         self.last_ok = _clock()
+        sid_raw = values.pop() if session_id is not None else None
+        if sid_raw:
+            # The session (refresh family) itself was logged out. Checked BEFORE the jti exemption: an exemption only
+            # ever spares force_login's brand-new token from the per-USER marker, and that token belongs to a new
+            # family (a different sid), so it can never match here.
+            try:
+                sid_revoked_at = datetime.fromisoformat(sid_raw)
+            except ValueError:
+                _log.warning("session_revocation_marker_malformed", extra={"user_id": str(user_id), "marker": "sid"})
+                return False, "marker_malformed", None
+            if issued_at <= sid_revoked_at:
+                self._remember(self._cache_key(user_id, issued_at, jti), True, sid_revoked_at)
+                return True, None, sid_revoked_at
         if jti is not None and values[0]:
             return False, None, None
         raw = values[-1]
@@ -643,7 +676,9 @@ async def _check(ctx: AuthContext, request: Request | None, *, sensitive: bool) 
 
     method = request.method.upper() if request is not None else None
     sensitive = sensitive or bool(request is not None and getattr(request.state, SENSITIVE_STATE_ATTR, False))
-    revoked, reason, revoked_at = await checker.lookup(ctx.user_id, ctx.issued_at, ctx.jti, fresh=sensitive)
+    revoked, reason, revoked_at = await checker.lookup(
+        ctx.user_id, ctx.issued_at, ctx.jti, fresh=sensitive, session_id=getattr(ctx, "session_id", None)
+    )
 
     if reason is not None:
         failed = reason in ("redis_unavailable", REASON_SKIPPED, "marker_malformed")
