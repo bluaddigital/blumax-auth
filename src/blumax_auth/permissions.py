@@ -107,12 +107,37 @@ C4  Bounded stale-on-error (`stale_grace_seconds`, default 0 = OFF, capped at 12
 
 Counters (optional): `blumax_core_permission_calls_total{outcome}` when the process
 has BLUMAX_METRICS_ENABLED=true and prometheus_client installed; see metrics.py.
+
+Local evaluation from access token v2 (0.6.0): local_mode = "off" | "shadow" | "local"
+-------------------------------------------------------------------------------------
+configure_permissions(local_mode=...) or, when the argument is not given, env PERMISSION_LOCAL_MODE. Unset -> "off".
+
+off     (DEFAULT) Exactly the behaviour above: no catalogue fetch, no Redis read, no extra log line or counter, the
+        local evaluator is not even built. Every BluMax service builds blumax-auth from the dev tip, so this default
+        must stay a no-op.
+shadow  The decision still comes from Core, exactly as above (same calls, cache, breaker, stale serving, warn/enforce).
+        After Core has answered, the token's own answer is computed too (local_permissions.py) and compared:
+        counted as blumax_permission_local_total{outcome="match"|"mismatch"|"fallback:<reason>"}; logged as
+        `permission_local_shadow` only on a mismatch (WARNING) or a fallback (INFO; v1_token and service_token are
+        counted, never logged), at most once per (outcome, reason, permission) per shadow_log_interval_seconds (60),
+        with the number suppressed since the last line. When Core fails, nothing is compared.
+local   The decision comes from the token when its answer is usable (counted local_allow / local_deny) -- Core is not
+        asked. Otherwise (any fallback reason) it is asked exactly as in "off", and the fallback is counted and logged
+        (`permission_local_fallback`, same rate limit). Routes marked admin=True always ask Core (fallback
+        admin_route, counted only). Never a grant on doubt: a fallback is never a yes or a no.
+        warn/enforce semantics of require_permission are unchanged; a warn-mode `permission_check` line for a local
+        decision carries `source="local"` (lines from Core carry no source field, exactly as before).
+
+Platform admins pass before any of this, in every mode (unchanged). Service tokens always use the Core path
+(fallback service_token) until service tokens v2 (G8). Fallback reasons and the freshness rule: local_permissions.py.
+A service that wraps `_Checker.granted` itself (IPD/OPD permission_resilience.py) keeps calling Core in every mode.
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import logging
+import os
 import time
 import uuid
 from collections import OrderedDict
@@ -127,7 +152,16 @@ from fastapi.security import HTTPAuthorizationCredentials
 from blumax_auth.context import AuthContext
 from blumax_auth.errors import AuthError, Forbidden, InvalidToken, MissingCredentials
 from blumax_auth.fastapi import _bearer, require_tenant
+from blumax_auth.local_permissions import (
+    DEFAULT_AUTHZ_VER_CACHE_SECONDS,
+    ENV_REDIS_URL,
+    MAX_AUTHZ_VER_CACHE_SECONDS,
+    LocalDecision,
+    LocalEvaluator,
+    env_cache_seconds,
+)
 from blumax_auth.metrics import core_permission_call as _count
+from blumax_auth.metrics import permission_local_event as _count_local
 
 _log = logging.getLogger("blumax_auth.permissions")
 
@@ -138,6 +172,11 @@ PERMISSIONS_PATH = "/api/v1/me/permissions"
 MAX_STALE_GRACE_SECONDS = 120.0
 
 Mode = Literal["enforce", "warn"]
+LocalMode = Literal["off", "shadow", "local"]
+LOCAL_MODES = ("off", "shadow", "local")
+ENV_LOCAL_MODE = "PERMISSION_LOCAL_MODE"
+#: Fallback reasons that are counted but never logged (expected while tokens v2 / service tokens v2 roll out).
+_QUIET_REASONS = frozenset({"v1_token", "service_token", "admin_route"})
 _CacheKey = tuple[uuid.UUID, uuid.UUID, str]
 
 
@@ -156,6 +195,7 @@ class _Answer:
     codes: frozenset[str]
     cached: bool
     latency_ms: float | None = None      # only when Core was actually asked
+    source: str = "core"                 # "local": decided from the token (local_mode="local")
 
 
 class PermissionCheckUnavailable(AuthError):
@@ -187,7 +227,15 @@ class _Checker:
         retry_on_no_answer: bool = False,
         retry_pause_seconds: float = 0.15,
         stale_grace_seconds: float = 0.0,
+        local: LocalEvaluator | None = None,
+        local_mode: LocalMode = "off",
+        shadow_log_interval_seconds: float = 60.0,
     ) -> None:
+        # 0.6.0: None while local_mode is "off" (the default) -- then nothing below differs from 0.5.x.
+        self.local = local
+        self.local_mode: LocalMode = local_mode if local is not None else "off"
+        self._log_interval = shadow_log_interval_seconds
+        self._logged: dict[tuple[str, str, str], tuple[float, int]] = {}
         self._core_url = core_url.rstrip("/")
         self._ttl = ttl_seconds
         self._timeout = timeout_seconds
@@ -259,6 +307,47 @@ class _Checker:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+        if self.local is not None:
+            await self.local.aclose()
+
+    # ── local evaluation (0.6.0; never reached while local_mode is "off") ──────
+
+    def note_local(
+        self, event: str, ctx: AuthContext, code: str, decision: LocalDecision, *,
+        outcome: str, route: str | None, core_decision: bool | None = None,
+    ) -> None:
+        """Count one outcome and log it, rate-limited per (outcome, reason, permission)."""
+        _count_local(outcome)
+        if not (outcome == "mismatch" or outcome.startswith("fallback:")) or decision.reason in _QUIET_REASONS:
+            return  # match / local_allow / local_deny are counted only
+        key = (outcome, decision.reason or "", code)
+        now = self._clock()
+        last = self._logged.get(key)
+        if last is not None and now - last[0] < self._log_interval:
+            self._logged[key] = (last[0], last[1] + 1)
+            return
+        if len(self._logged) > 5000:
+            self._logged.clear()
+        self._logged[key] = (now, 0)
+        extra: dict[str, object] = {
+            "outcome": "mismatch" if outcome == "mismatch" else "fallback",
+            "permission": code,
+            "route": route or "<unknown>",
+            "tenant_id": str(ctx.tenant_id),
+            "user_id": str(ctx.user_id),
+            "suppressed": last[1] if last is not None else 0,
+        }
+        if decision.reason is not None:
+            extra["reason"] = decision.reason
+        if core_decision is not None:
+            extra["core_decision"] = "allow" if core_decision else "deny"
+        if decision.granted is not None:
+            extra["local_decision"] = "allow" if decision.granted else "deny"
+        for name in ("catalogue_version", "token_authz_ver", "current_authz_ver"):
+            value = getattr(decision, name)
+            if value is not None:
+                extra[name] = value
+        _log.log(logging.WARNING if outcome == "mismatch" else logging.INFO, event, extra=extra)
 
     def clear(self) -> None:
         self._cache.clear()
@@ -449,6 +538,11 @@ def configure_permissions(
     retry_on_no_answer: bool = True,
     retry_pause_seconds: float = 0.15,
     stale_grace_seconds: float = 0.0,
+    local_mode: LocalMode | None = None,
+    authz_ver_redis_url: str | None = None,
+    authz_ver_cache_seconds: float | None = None,
+    shadow_log_interval_seconds: float = 60.0,
+    authz_ver_redis: object | None = None,
 ) -> None:
     """Point this service at Core for permission checks. Call once, at startup.
 
@@ -467,6 +561,18 @@ def configure_permissions(
                         caller key for up to this many seconds past its TTL. 0 (default) = off. Capped at MAX_STALE_GRACE_SECONDS (120);
                         a larger value is clamped with a warning. Needs ttl_seconds > 0. Never on routes marked admin=True.
                         Services read it from PERMISSION_CHECK_STALE_GRACE_SECONDS; enabling it is an owner decision (OD-DEP-1).
+
+    0.6.0 -- local evaluation from access token v2 (module docstring, "Local evaluation"); every default = 0.5.x:
+    local_mode          "off" | "shadow" | "local". None -> env PERMISSION_LOCAL_MODE -> "off". An invalid value raises
+                        ValueError. "off" builds nothing and changes nothing.
+    authz_ver_redis_url Redis to read Core's `authctx:authz_ver` from: the Redis Core's API writes to (Core's
+                        REDIS_URL). None -> env PERMISSION_AUTHZ_VER_REDIS_URL -> the client configure_session_revocation()
+                        set up (today that is the same Redis, db 0). None of them -> every check falls back
+                        (authz_ver_not_configured). Needs the redis package (extra `session-revocation`).
+    authz_ver_cache_seconds  How long this process reuses the authz_ver it read (also a failed read). None -> env
+                        PERMISSION_AUTHZ_VER_CACHE_SECONDS -> 2. Clamped to 0..5.
+    shadow_log_interval_seconds  Rate limit of the shadow / fallback log lines per (outcome, reason, permission).
+    authz_ver_redis     Test seam: an object with `async get(key)` used instead of a URL.
     """
     global _checker
     if not core_url or not core_url.strip():
@@ -488,7 +594,35 @@ def configure_permissions(
             "permission_stale_grace_clamped",
             extra={"configured": stale_grace_seconds, "max": MAX_STALE_GRACE_SECONDS},
         )
+    if local_mode is None:
+        local_mode = (os.environ.get(ENV_LOCAL_MODE, "").strip().lower() or "off")  # type: ignore[assignment]
+    if local_mode not in LOCAL_MODES:
+        raise ValueError(f"local_mode must be one of {LOCAL_MODES}, got {local_mode!r}")
+    if shadow_log_interval_seconds < 0:
+        raise ValueError("shadow_log_interval_seconds must be >= 0")
+    local: LocalEvaluator | None = None
+    if local_mode != "off":
+        cache_seconds = authz_ver_cache_seconds if authz_ver_cache_seconds is not None else env_cache_seconds()
+        if cache_seconds is None:
+            cache_seconds = DEFAULT_AUTHZ_VER_CACHE_SECONDS
+        if cache_seconds < 0:
+            raise ValueError("authz_ver_cache_seconds must be >= 0")
+        if cache_seconds > MAX_AUTHZ_VER_CACHE_SECONDS:
+            _log.warning(
+                "permission_authz_ver_cache_clamped",
+                extra={"configured": cache_seconds, "max": MAX_AUTHZ_VER_CACHE_SECONDS},
+            )
+        local = LocalEvaluator(
+            core_url=core_url, timeout_seconds=timeout_seconds, transport=transport, clock=clock,
+            redis=authz_ver_redis,
+            redis_url=authz_ver_redis_url or os.environ.get(ENV_REDIS_URL, "").strip() or None,
+            authz_ver_cache_seconds=cache_seconds,
+        )
+        _log.info("permission_local_mode", extra={"local_mode": local_mode})
     _checker = _Checker(
+        local=local,
+        local_mode=local_mode,
+        shadow_log_interval_seconds=shadow_log_interval_seconds,
         core_url=core_url,
         ttl_seconds=ttl_seconds,
         timeout_seconds=timeout_seconds,
@@ -559,7 +693,9 @@ def require_permission(code: str, *, mode: Mode = "enforce", admin: bool = False
             raise RuntimeError("blumax_auth.configure_permissions() has not been called")
 
         try:
-            answer = await _granted(checker, ctx, credentials.credentials, admin=admin)
+            allowed, answer = await _decide(
+                checker, ctx, credentials.credentials, code, admin=admin, route=_route_of(request),
+            )
         except AuthError as exc:
             if mode == "warn":
                 _emit(
@@ -577,17 +713,17 @@ def require_permission(code: str, *, mode: Mode = "enforce", admin: bool = False
                 return ctx
             raise
 
-        if code in answer.codes:
+        if allowed:
             if mode == "warn":
                 _emit(
                     request, ctx, code, decision="allow", cached=answer.cached,
-                    core_latency_ms=answer.latency_ms,
+                    core_latency_ms=answer.latency_ms, source=answer.source,
                 )
             return ctx
         if mode == "warn":
             _emit(
                 request, ctx, code, decision="would_deny", reason="missing_permission",
-                cached=answer.cached, core_latency_ms=answer.latency_ms,
+                cached=answer.cached, core_latency_ms=answer.latency_ms, source=answer.source,
             )
             return ctx
         raise Forbidden(f"Requires permission: {code}")
@@ -621,8 +757,51 @@ async def check_permission(ctx: AuthContext, token: str, code: str, *, admin: bo
     checker = _checker
     if checker is None:
         raise RuntimeError("blumax_auth.configure_permissions() has not been called")
+    allowed, _ = await _decide(checker, ctx, token, code, admin=admin, route=None)
+    return allowed
+
+
+async def _decide(
+    checker: _Checker, ctx: AuthContext, token: str, code: str, *, admin: bool, route: str | None,
+) -> tuple[bool, _Answer]:
+    """(allowed, how it was decided). With local_mode "off" this is exactly `code in Core's answer`."""
+    local = checker.local
+    if local is None or checker.local_mode == "off":
+        answer = await _granted(checker, ctx, token, admin=admin)
+        return code in answer.codes, answer
+
+    if checker.local_mode == "local":
+        # An admin / role-management / break-glass route never takes the token's answer: the up-to-5 s authz_ver cache
+        # is a staleness window those routes must not have (same spirit as "never stale-served" for C4).
+        decision = LocalDecision(granted=None, reason="admin_route") if admin else await local.evaluate(ctx, token, code)
+        if decision.granted is not None:
+            checker.note_local(
+                "permission_local_decision", ctx, code, decision,
+                outcome="local_allow" if decision.granted else "local_deny", route=route,
+            )
+            return decision.granted, _Answer(codes=frozenset(), cached=True, source="local")
+        checker.note_local("permission_local_fallback", ctx, code, decision, outcome=f"fallback:{decision.reason}", route=route)
+        answer = await _granted(checker, ctx, token, admin=admin)
+        return code in answer.codes, answer
+
+    # shadow: Core decides (a Core failure propagates exactly as in "off" and nothing is compared).
     answer = await _granted(checker, ctx, token, admin=admin)
-    return code in answer.codes
+    allowed = code in answer.codes
+    try:
+        decision = await local.evaluate(ctx, token, code)
+        if decision.granted is None:
+            outcome = f"fallback:{decision.reason}"
+        else:
+            outcome = "match" if decision.granted == allowed else "mismatch"
+        checker.note_local("permission_local_shadow", ctx, code, decision, outcome=outcome, route=route, core_decision=allowed)
+    except Exception:  # shadow work must never change the request
+        _log.exception("permission_local_shadow_error")
+    return allowed, answer
+
+
+def _route_of(request: Request) -> str | None:
+    route = request.scope.get("route")
+    return getattr(route, "path", None)
 
 
 async def _granted(checker: _Checker, ctx: AuthContext, token: str, *, admin: bool) -> _Answer:
@@ -653,6 +832,7 @@ def _emit(
     reason: str | None = None,
     core_latency_ms: float | None = None,
     core_status: int | None = None,
+    source: str = "core",
 ) -> None:
     """One `permission_check` event. Plain scalars only: no token, no permission list.
 
@@ -680,4 +860,6 @@ def _emit(
         extra["core_latency_ms"] = core_latency_ms
     if core_status is not None:
         extra["core_status"] = core_status
+    if source != "core":  # only local decisions (local_mode="local") add the field; Core-path lines are unchanged
+        extra["source"] = source
     _log.log(logging.INFO if decision == "allow" else logging.WARNING, "permission_check", extra=extra)
