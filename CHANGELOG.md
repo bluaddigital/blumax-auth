@@ -2,6 +2,21 @@
 
 Started with 0.5.2; earlier releases are described in their tag commits (`git log v0.5.1`).
 
+## 0.6.2 (unreleased: no tag yet, the owner tags it)
+
+Phase 5b: per-session access revocation. **No behaviour change unless Core writes the new marker** (Core switch
+`SSO_SID_REVOCATION=on`, default off): the extra key is simply absent.
+
+- `AuthContext.session_id`: the v2 `sid` claim (None for v1/service tokens; a malformed value reads as None and never
+  fails verification).
+- `check_session_revocation` / `session_revocation_check`: a token that carries a `sid` also reads
+  `session_revoked_sid:{sid}` (ISO timestamp, written by Core when ONE session -- a refresh family -- is logged out;
+  SSO child sessions share their source's sid) in the SAME `MGET` as the per-user keys: one round trip, one timeout.
+  `iat <= marker` = revoked (401 in enforce, `would_reject` in warn). It is checked before the jti exemption (an
+  exemption only spares force_login's new token from the per-USER marker, and that token has a different sid). A
+  malformed sid marker and an unavailable store follow the existing fail modes exactly; a revoked answer is remembered
+  like any other. A token without a `sid` reads exactly the keys it read before.
+
 ## 0.6.1 (unreleased: no tag yet, the owner tags it)
 
 G6 preparation: local evaluation is usable by every service and never slows a request. **local_mode="off" (the
