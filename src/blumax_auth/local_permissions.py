@@ -31,6 +31,15 @@ The answer is usable only when ALL of these hold (checked in this order; the fir
        minted: role edit, role assignment, membership/facility change, ...)   authz_ver_stale
      Bounded staleness when the answer IS used: an authorization write is seen at the latest after the cache window
      (authz_ver_cache_seconds, default 2 s, clamped to 5 s).
+     SCOPED (0.6.3; Core AUTHZ_VER_SCOPE=scoped): the token also carries `authz_tv` (its tenant's version) and
+     `authz_uv` (its user-in-tenant version), opaque non-repeating strings. Then ONE MGET reads
+       authctx:authz_ver, authctx:authz_ver:t:{tid}, authctx:authz_ver:u:{tid}:{sub}
+     (cached per (tid, sub) for the same window, at most MAX_SCOPED_CACHE_ENTRIES callers) and ALL THREE must equal
+     the token's values. A tenant / user key that is ABSENT never matches (Core creates both before it mints a token,
+     so absent means evicted or flushed: ask Core). Mismatch -> authz_ver_stale with `authz_stale_scope` =
+     global | tenant | user; global key absent -> authz_ver_unset; Redis trouble -> authz_ver_unavailable; a token
+     with only one of the two claims, or a non-string one -> no_authz_ver. A token WITHOUT authz_tv/authz_uv is
+     checked exactly as before (global only).
   5. the catalogue (Core GET /api/v1/authz/catalogue: version + ordered {idx, code, status}) is held at a version
      >= the token's cv. It is PRELOADED in the background: the first staff v2 token this process sees (or the first
      naming a newer cv) starts ONE fetch, with that caller's own token (Core accepts any authenticated staff or service
@@ -65,6 +74,7 @@ import binascii
 import contextlib
 import logging
 import os
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -78,6 +88,11 @@ _log = logging.getLogger("blumax_auth.permissions")
 
 CATALOGUE_PATH = "/api/v1/authz/catalogue"
 AUTHZ_VER_KEY = "authctx:authz_ver"
+#: Scoped versions (0.6.3), written by Core when AUTHZ_VER_SCOPE=scoped (blumax-backend app/core/auth_context_cache.py).
+AUTHZ_VER_TENANT_KEY = "authctx:authz_ver:t:{tenant_id}"
+AUTHZ_VER_USER_KEY = "authctx:authz_ver:u:{tenant_id}:{user_id}"
+#: Upper bound on (tenant, user) entries in the scoped freshness cache; expired entries go first, then the oldest.
+MAX_SCOPED_CACHE_ENTRIES = 10_000
 
 #: Upper bound for the authz_ver cache (the plan's "<= 5 s local cache").
 MAX_AUTHZ_VER_CACHE_SECONDS = 5.0
@@ -166,6 +181,8 @@ class LocalDecision:
     catalogue_version: int | None = None
     token_authz_ver: int | None = None
     current_authz_ver: int | None = None
+    #: For authz_ver_stale on a scoped token: which version moved ("global" | "tenant" | "user").
+    authz_stale_scope: str | None = None
 
     @property
     def usable(self) -> bool:
@@ -211,6 +228,11 @@ class LocalEvaluator:
         # (expires_at, value or None, failure reason or None)
         self._ver_cached: tuple[float, int | None, str | None] | None = None
         self._ver_task: asyncio.Task[tuple[int | None, str | None]] | None = None
+        # Scoped freshness: (tid, sub) -> (expires_at, (global, tenant, user) or None, failure reason or None); insertion
+        # order = age, so the oldest is evicted first. One in-flight MGET per (tid, sub).
+        self._scoped_cached: OrderedDict[tuple[str, str], tuple[float, tuple[Any, Any, Any] | None, str | None]] = OrderedDict()
+        self._scoped_tasks: dict[tuple[str, str], asyncio.Task[tuple[tuple[Any, Any, Any] | None, str | None]]] = {}
+        self._scoped_max = MAX_SCOPED_CACHE_ENTRIES
         self._catalogue: Catalogue | None = None
         self._cat_task: asyncio.Task[None] | None = None
         self._cat_blocked_until = float("-inf")
@@ -271,11 +293,28 @@ class LocalEvaluator:
         if not isinstance(token_ver, int) or isinstance(token_ver, bool):
             return _fallback("no_authz_ver", catalogue_version=cv)
 
-        current, why = await self._current_authz_ver()
-        if why is not None:
-            return _fallback(why, catalogue_version=cv, token_authz_ver=token_ver)
-        if current != token_ver:
-            return _fallback("authz_ver_stale", catalogue_version=cv, token_authz_ver=token_ver, current_authz_ver=current)
+        tv, uv = claims.get("authz_tv"), claims.get("authz_uv")
+        if tv is None and uv is None:
+            current, why = await self._current_authz_ver()
+            if why is not None:
+                return _fallback(why, catalogue_version=cv, token_authz_ver=token_ver)
+            if current != token_ver:
+                return _fallback("authz_ver_stale", catalogue_version=cv, token_authz_ver=token_ver, current_authz_ver=current)
+        else:
+            if not isinstance(tv, str) or not isinstance(uv, str) or not tv or not uv:
+                return _fallback("no_authz_ver", catalogue_version=cv, token_authz_ver=token_ver)
+            values, why = await self._current_scoped(str(claims.get("tid")), str(claims.get("sub")))
+            if why is not None or values is None:
+                return _fallback(why or "authz_ver_unavailable", catalogue_version=cv, token_authz_ver=token_ver)
+            current, cur_tv, cur_uv = values
+            if current is None:
+                return _fallback("authz_ver_unset", catalogue_version=cv, token_authz_ver=token_ver)
+            for scope, mine, now_ in (("global", token_ver, current), ("tenant", tv, cur_tv), ("user", uv, cur_uv)):
+                if mine != now_:   # an absent tenant / user key is None: never equal to a token's string
+                    return _fallback(
+                        "authz_ver_stale", catalogue_version=cv, token_authz_ver=token_ver,
+                        current_authz_ver=current, authz_stale_scope=scope,
+                    )
         fresh = {"catalogue_version": cv, "token_authz_ver": token_ver, "current_authz_ver": current}
 
         catalogue = self._catalogue
@@ -351,6 +390,59 @@ class LocalEvaluator:
             return None, "authz_ver_unset"
         try:
             return int(raw.decode() if isinstance(raw, bytes) else raw), None
+        except (TypeError, ValueError):
+            return None, "authz_ver_unavailable"
+
+    async def _current_scoped(self, tid: str, sub: str) -> tuple[tuple[Any, Any, Any] | None, str | None]:
+        """((global int | None, tenant str | None, user str | None), None) or (None, fallback reason), from ONE MGET.
+        Cached per (tid, sub) for authz_ver_cache_seconds (failures too); bounded to MAX_SCOPED_CACHE_ENTRIES."""
+        key = (tid, sub)
+        now = self._clock()
+        cached = self._scoped_cached.get(key)
+        if cached is not None and now < cached[0]:
+            return cached[1], cached[2]
+        task = self._scoped_tasks.get(key)
+        if task is None:
+            task = asyncio.ensure_future(self._read_scoped(tid, sub))
+            self._scoped_tasks[key] = task
+            task.add_done_callback(lambda t, k=key: self._scoped_settled(k, t))
+        return await asyncio.shield(task)
+
+    def _scoped_settled(self, key: tuple[str, str], task: asyncio.Task[tuple[tuple[Any, Any, Any] | None, str | None]]) -> None:
+        if self._scoped_tasks.get(key) is task:
+            del self._scoped_tasks[key]
+        if task.cancelled() or task.exception() is not None:
+            return
+        values, why = task.result()
+        cache = self._scoped_cached
+        cache.pop(key, None)
+        if len(cache) >= self._scoped_max:
+            now = self._clock()
+            for k in [k for k, v in cache.items() if v[0] <= now]:
+                del cache[k]
+            while len(cache) >= self._scoped_max:
+                cache.popitem(last=False)
+        cache[key] = (self._clock() + self._ver_ttl, values, why)
+
+    async def _read_scoped(self, tid: str, sub: str) -> tuple[tuple[Any, Any, Any] | None, str | None]:
+        client = self._redis_client()
+        if client is None:
+            return None, "authz_ver_not_configured"
+        keys = [
+            AUTHZ_VER_KEY,
+            AUTHZ_VER_TENANT_KEY.format(tenant_id=tid),
+            AUTHZ_VER_USER_KEY.format(tenant_id=tid, user_id=sub),
+        ]
+        try:
+            raw = await asyncio.wait_for(client.mget(keys), self._redis_timeout)
+            g, t, u = (r.decode() if isinstance(r, bytes) else r for r in raw)
+        except Exception as exc:  # noqa: BLE001 -- includes ACL NOPERM, timeouts, connection errors, a short reply
+            _log.warning("permission_local_authz_ver_unavailable error=%s", type(exc).__name__, extra={"error": type(exc).__name__})
+            return None, "authz_ver_unavailable"
+        if g is None:
+            return (None, t, u), None
+        try:
+            return (int(g), t, u), None
         except (TypeError, ValueError):
             return None, "authz_ver_unavailable"
 

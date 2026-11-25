@@ -17,6 +17,27 @@ versions PR (#24); this release is built on 0.6.2 and rebases onto it (the only 
   a delegated token (Core `POST /auth/token-exchange`), and `AuthContext.is_delegated`. None for a user's own token
   and for service tokens. A malformed `act`, or `act` on a service token, is refused (InvalidToken).
 
+## 0.6.3 (unreleased: no tag yet, the owner tags it)
+
+Scoped "permissions changed" versions (on top of 0.6.2; 0.6.4 is taken by the G8 service-token PR #25).
+
+**A token without the new claims is checked exactly as in 0.6.1** (one GET of the global `authctx:authz_ver`, same
+cache, same reasons). `local_mode="off"` (the default) is unchanged: nothing is read.
+
+- Core with `AUTHZ_VER_SCOPE=scoped` adds `authz_tv` (the tenant's version) and `authz_uv` (the user-in-tenant version)
+  to access token v2. When a token carries them, local evaluation reads `authctx:authz_ver`,
+  `authctx:authz_ver:t:{tid}` and `authctx:authz_ver:u:{tid}:{sub}` in ONE `MGET` and needs all three to equal the
+  token's values. Cached per (tenant, user) for the same `authz_ver_cache_seconds` window (<= 5 s), one in-flight read
+  per (tenant, user), at most 10 000 cached callers (expired first, then oldest).
+- An ABSENT tenant / user key never matches (Core creates both before minting, so absent = evicted / flushed). The
+  values are opaque non-repeating strings, compared with `!=`.
+- Reasons unchanged: mismatch at any level -> `authz_ver_stale`, now with `authz_stale_scope` = `global` | `tenant` |
+  `user` in the log line (text and `extra`) and on `LocalDecision`; global key absent -> `authz_ver_unset`; Redis
+  error / timeout / short reply -> `authz_ver_unavailable`; only one of the two claims, or a non-string / empty one ->
+  `no_authz_ver`. Never a local grant on doubt.
+- The Redis user needs `MGET` on `authctx:authz_ver:*` (the same key family as before).
+- **Rollout: every service on >= 0.6.3 BEFORE Core switches to `scoped`.** An older library ignores the new claims and
+  compares the global key alone, which Core no longer bumps for tenant / user changes in scoped mode.
 ## 0.6.2 (unreleased: no tag yet, the owner tags it)
 
 Phase 5b: per-session access revocation. **No behaviour change unless Core writes the new marker** (Core switch

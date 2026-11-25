@@ -358,7 +358,7 @@ class _Checker:
             extra["core_decision"] = "allow" if core_decision else "deny"
         if decision.granted is not None:
             extra["local_decision"] = "allow" if decision.granted else "deny"
-        for name in ("catalogue_version", "token_authz_ver", "current_authz_ver"):
+        for name in ("catalogue_version", "token_authz_ver", "current_authz_ver", "authz_stale_scope"):
             value = getattr(decision, name)
             if value is not None:
                 extra[name] = value
@@ -369,7 +369,7 @@ class _Checker:
             text += f" core={extra['core_decision']}"
         if "local_decision" in extra:
             text += f" local={extra['local_decision']}"
-        for name in ("catalogue_version", "token_authz_ver", "current_authz_ver"):
+        for name in ("catalogue_version", "token_authz_ver", "current_authz_ver", "authz_stale_scope"):
             if name in extra:
                 text += f" {name}={extra[name]}"
         if extra["suppressed"]:
