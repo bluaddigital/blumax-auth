@@ -12,7 +12,9 @@ met is a fallback, never a "no".
 
 The answer is usable only when ALL of these hold (checked in this order; the first failure is the fallback reason):
 
-  1. the token is a staff access token v2 (`ver: 2`, `type: "access"`)       else v1_token / service_token
+  1. the token is a staff access token v2 (`ver: 2`, `type: "access"`), or  else v1_token / service_token
+     (0.6.4) a SCOPED service token (`ver: 2`, `type: "service"`, a `perm` claim -- Core
+     SERVICE_TOKEN_SCOPES=enforce); an unscoped service token is service_token
      (its claims are re-read from the SAME token require_tenant() just verified; sub/tid must match the context,
      else token_unreadable)
   2. it carries a well-formed `perm` claim                                    else no_perm
@@ -59,8 +61,10 @@ The answer is usable only when ALL of these hold (checked in this order; the fir
 Bitset format (blumax-backend app/core/permission_index.py pack_indexes/unpack_indexes, mirrored exactly): bit i lives
 in byte i // 8 at position i % 8 (LSB first), trailing zero bytes trimmed, base64url without padding, "" = no codes.
 
-Platform admins never reach this module (require_permission/check_permission pass them first, unchanged). Service
-tokens are a fallback (service_token): they keep today's Core path until service tokens v2 (G8).
+Platform admins never reach this module (require_permission/check_permission pass them first, unchanged). An unscoped
+service token is a fallback (service_token) and keeps today's Core path; a scoped one (G8) is answered from its `perm`.
+A delegated token (Core token exchange, `act` claim) is a staff access token and needs nothing special: its `perm` is
+already the user's permissions INTERSECT the service's scopes.
 """
 from __future__ import annotations
 
@@ -261,13 +265,16 @@ class LocalEvaluator:
     # ── steps ─────────────────────────────────────────────────────────────────
 
     async def _evaluate(self, ctx: AuthContext, token: str, code: str) -> LocalDecision:
-        if ctx.is_service:
-            return _fallback("service_token")
         try:
             claims = jwt.get_unverified_claims(token)  # verified moments ago by require_tenant(); re-read, not re-trusted
         except JWTError:
-            return _fallback("token_unreadable")
-        if claims.get("ver") != 2 or claims.get("type") != "access":
+            return _fallback("service_token" if ctx.is_service else "token_unreadable")
+        if ctx.is_service:
+            # 0.6.4 (G8): a SCOPED service token (Core SERVICE_TOKEN_SCOPES=enforce: ver=2 + perm = role INTERSECT the
+            # account's scopes) is evaluated exactly like a staff v2 token. An unscoped one keeps asking Core.
+            if claims.get("ver") != 2 or claims.get("type") != "service" or "perm" not in claims:
+                return _fallback("service_token")
+        elif claims.get("ver") != 2 or claims.get("type") != "access":
             return _fallback("v1_token")
         if str(claims.get("sub")) != str(ctx.user_id) or str(claims.get("tid")) != str(ctx.tenant_id):
             return _fallback("token_unreadable")

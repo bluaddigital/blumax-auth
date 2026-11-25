@@ -2,6 +2,21 @@
 
 Started with 0.5.2; earlier releases are described in their tag commits (`git log v0.5.1`).
 
+## 0.6.4 (unreleased: no tag yet, the owner tags it)
+
+G8: scoped service tokens + delegated identity. **No behaviour change for any token Core issues today**: both need Core
+switches that default off (`SERVICE_TOKEN_SCOPES`, `TOKEN_EXCHANGE_ENABLED`). 0.6.3 is taken by the scoped authz
+versions PR (#24); this release is built on 0.6.2 and rebases onto it (the only overlap is the version number and
+`_evaluate`'s first lines vs #24's freshness block -- different hunks).
+
+- **Local evaluation of scoped service tokens** (`local_mode` shadow/local only): a service token with `ver: 2` and a
+  `perm` claim (Core `SERVICE_TOKEN_SCOPES=enforce`: the role's codes INTERSECT the account's scopes) is answered from
+  the token exactly like a staff v2 token (same freshness and catalogue rules). A service token without `perm` (every
+  token today, and any unscoped account) still falls back with reason `service_token` and asks Core.
+- **`AuthContext.actor`** (`blumax_auth.Actor`: `service_account_id`, `service_name`) from the RFC 8693 `act` claim of
+  a delegated token (Core `POST /auth/token-exchange`), and `AuthContext.is_delegated`. None for a user's own token
+  and for service tokens. A malformed `act`, or `act` on a service token, is refused (InvalidToken).
+
 ## 0.6.3 (unreleased: no tag yet, the owner tags it)
 
 Scoped "permissions changed" versions (on top of 0.6.2; 0.6.4 is taken by the G8 service-token PR #25).

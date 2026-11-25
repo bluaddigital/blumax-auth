@@ -543,7 +543,7 @@ class TestShadow:
     async def test_v1_and_service_tokens_counted_not_logged(self, client, signer, core, redis, caplog):
         v1 = mint(signer, v2=False)
         core.grant(v1, HELD)
-        svc = mint(signer, type="service")
+        svc = mint(signer, type="service", perm=None)
         core.grant(svc, HELD)
         with caplog.at_level(logging.INFO, logger=LOGGER):
             await self._ask(client, "/held", v1)
@@ -655,7 +655,7 @@ class TestLocal:
         assert core.calls(PERMS) == 1 and core.calls(CATALOGUE) == 0
 
     async def test_service_token_uses_core(self, client, signer, core):
-        token = mint(signer, type="service")
+        token = mint(signer, type="service", perm=None)
         core.grant(token, HELD)
         assert (await client.get("/held", headers=bearer(token))).status_code == 200
         assert core.calls(PERMS) == 1
@@ -839,7 +839,7 @@ class TestBackgroundPreload:
 
     async def test_v1_and_service_tokens_do_not_start_a_preload(self, client, signer, core, clock, redis):
         configure(core, clock, redis, local_mode="local")
-        for token in (mint(signer, v2=False), mint(signer, type="service")):
+        for token in (mint(signer, v2=False), mint(signer, type="service", perm=None)):
             core.grant(token, HELD)
             await client.get("/held", headers=bearer(token))
         await settle()

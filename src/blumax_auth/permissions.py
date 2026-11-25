@@ -128,8 +128,9 @@ local   The decision comes from the token when its answer is usable (counted loc
         warn/enforce semantics of require_permission are unchanged; a warn-mode `permission_check` line for a local
         decision carries `source="local"` (lines from Core carry no source field, exactly as before).
 
-Platform admins pass before any of this, in every mode (unchanged). Service tokens always use the Core path
-(fallback service_token) until service tokens v2 (G8). Fallback reasons and the freshness rule: local_permissions.py.
+Platform admins pass before any of this, in every mode (unchanged). Unscoped service tokens always use the Core path
+(fallback service_token); a scoped one (0.6.4, G8: ver=2 + perm) is evaluated like a staff v2 token. Fallback reasons
+and the freshness rule: local_permissions.py.
 
 Where the local decision sits: in `_decide()`, which require_permission() and check_permission() call, ABOVE
 `_Checker.granted`. `granted` is only the Core path. A service that wraps `_Checker.granted` itself (IPD/OPD
