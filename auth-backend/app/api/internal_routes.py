@@ -3,9 +3,10 @@ from __future__ import annotations
 import hmac
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_db
+from app.api.deps import get_db, get_redis
 from app.core.config import settings
 from app.schemas.internal import (
     MembershipRevokedRequest,
@@ -58,13 +59,13 @@ def require_core_token_mint_key(
     dependencies=[Depends(require_core_user_sync_key)],
 )
 async def sync_user_route(
-    body: UserSyncRequest, db: AsyncSession = Depends(get_db),
+    body: UserSyncRequest, db: AsyncSession = Depends(get_db), redis: Redis = Depends(get_redis),
 ) -> None:
     try:
         await sync_user_from_core(
             db, user_id=body.user_id, identifier=body.identifier,
             username=body.username, hashed_password=body.hashed_password,
-            is_active=body.is_active,
+            is_active=body.is_active, redis=redis,
         )
     except UserSyncConflictError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc

@@ -4,7 +4,11 @@ reset (unauthenticated, code-based).
 Design choice, stated explicitly: neither change_password nor
 reset_password mints a replacement token in the same call. Both simply
 revoke every existing session (forcing a fresh login everywhere) and
-return 204. This sidesteps the classic "I changed my password and
+return 204. "Every existing session" means BOTH halves (audit D-7): the
+user's refresh rows are revoked in the database in the SAME transaction as
+the new password (a refresh token cannot outlive the old password), and the
+Redis marker is then written so access tokens already issued stop being
+accepted by every consumer. This sidesteps the classic "I changed my password and
 immediately got logged out by my own request" race entirely, rather than
 solving it with a jti-exemption mechanism (which the shared blumax_auth
 library's session-revocation format does support, see app/core/
@@ -25,6 +29,7 @@ from app.core.password_reset import consume_reset_code, mint_reset_code
 from app.core.security import hash_password, verify_password_constant_time
 from app.core.session_revocation import revoke_user_sessions
 from app.models.user import User
+from app.services.auth_service import revoke_all_refresh_tokens_stmt
 
 logger = structlog.get_logger(__name__)
 
@@ -48,6 +53,7 @@ async def change_password(
         raise PasswordError(f"password must be at least {settings.PASSWORD_MIN_LENGTH} characters")
 
     user.hashed_password = hash_password(new_password)
+    await db.execute(revoke_all_refresh_tokens_stmt(user.id))
     await db.commit()
     await revoke_user_sessions(redis, user_id)
     logger.info("password.change.success", user_id=user_id)
@@ -89,6 +95,7 @@ async def confirm_password_reset(
         raise PasswordError("Invalid or expired reset code")
 
     user.hashed_password = hash_password(new_password)
+    await db.execute(revoke_all_refresh_tokens_stmt(user.id))
     await db.commit()
     await revoke_user_sessions(redis, user_id)
     logger.info("password.reset_confirm.success", user_id=user_id)

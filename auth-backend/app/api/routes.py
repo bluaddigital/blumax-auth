@@ -50,10 +50,12 @@ async def login_route(
 
 
 @router.post("/refresh", response_model=TokenResponse)
-async def refresh_route(body: RefreshRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+async def refresh_route(
+    body: RefreshRequest, db: AsyncSession = Depends(get_db), redis: Redis = Depends(get_redis),
+) -> TokenResponse:
     try:
         access_token, refresh_token = await auth_service.refresh(
-            db, refresh_token=body.refresh_token, tenant_id=body.tenant_id,
+            db, refresh_token=body.refresh_token, tenant_id=body.tenant_id, redis=redis,
         )
     except auth_service.TenantSelectionRequiredError as exc:
         raise HTTPException(

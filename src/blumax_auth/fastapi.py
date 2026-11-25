@@ -66,6 +66,7 @@ def configure(
     ttl_seconds: float = 3600.0,
     leeway_seconds: int = 30,
     also_trust: list[TrustAnchor] | None = None,
+    service_audience: str | None = None,
 ) -> None:
     """Point this service at Core's key set. Call once, at app startup.
 
@@ -76,11 +77,16 @@ def configure(
     swap turned out to be a hard cutover, not a staged rollout (see
     MultiIssuerTokenVerifier's own docstring). Omitted (the default):
     zero behavior change from before this parameter existed -- every
-    existing caller of configure() is unaffected."""
+    existing caller of configure() is unaffected.
+
+    `service_audience` (0.6.0, observe only): this service's own access-token-v2 audience, e.g. "blumax-opd" (Core's
+    SERVICE_AUDIENCES). A v2 token lacking it is still ACCEPTED (`audience` stays the enforced one) but counted and
+    logged as `token_service_audience_missing`; refusing it is G6. None (default) = no check, exactly as before."""
     global _verifier, _jwks
     _jwks = JwksCache(jwks_url, ttl_seconds=ttl_seconds)
     primary = TokenVerifier(
-        _jwks, issuer=issuer, audience=audience, leeway_seconds=leeway_seconds
+        _jwks, issuer=issuer, audience=audience, leeway_seconds=leeway_seconds,
+        service_audience=service_audience,
     )
     if not also_trust:
         _verifier = primary
@@ -300,6 +306,7 @@ def install_error_handler(app: object, renderer: Callable[[AuthError], object] |
                     "details": {},
                 }
             },
+            headers=getattr(exc, "headers", None),
         )
 
     app.add_exception_handler(AuthError, _handler)  # type: ignore[attr-defined]
