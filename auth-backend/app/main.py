@@ -16,11 +16,16 @@ from app.api.routes import health_router, jwks_router, router
 from app.api.service_routes import service_router
 from app.api.sso_routes import sso_router
 from app.core.config import settings
+from app.core.log_safety import exception_processor, redact_sensitive_keys
 
 structlog.configure(
     processors=[
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.add_log_level,
+        redact_sensitive_keys,
+        # Exceptions render as a text traceback (type, message, frames) with no
+        # local variables. Without this, exc_info was dropped entirely.
+        exception_processor(),
         # Never log secrets: passwords, hashes, private keys, or raw
         # token values are never passed as log fields anywhere in this
         # service -- only user_id/jti/identifier/reason, confirmed by
