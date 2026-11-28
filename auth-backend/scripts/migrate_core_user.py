@@ -286,7 +286,7 @@ async def classify(db, valid_rows: list[ValidRow]) -> MigrationPlan:
             continue
 
         existing_by_identifier = (
-            await db.execute(select(User).where(User.identifier == row.identifier))
+            await db.execute(select(User).where(User.identifier == row.identifier, User.tenant_id.is_(None)))
         ).scalar_one_or_none()
         if existing_by_identifier is not None:
             conflicts.append(ConflictRow(

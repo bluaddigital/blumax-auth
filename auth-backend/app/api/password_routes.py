@@ -58,7 +58,9 @@ async def request_password_reset_route(
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many requests") from exc
 
     try:
-        code = await password_service.request_password_reset(db, redis, identifier=body.identifier)
+        code = await password_service.request_password_reset(
+            db, redis, identifier=body.identifier, tenant=body.tenant,
+        )
     except PasswordResetUnavailableError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Try again shortly") from exc
 

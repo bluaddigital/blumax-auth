@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.session_revocation import revoke_user_sessions
-from app.models.user import User
+from app.models.user import User, normalize_username
 from app.services.auth_service import revoke_all_refresh_tokens_stmt
 
 logger = structlog.get_logger(__name__)
@@ -61,12 +61,19 @@ async def sync_user_from_core(
     keep working; without it the refresh rows are still revoked and an error is logged for the missing marker."""
     existing = await db.get(User, user_id)
 
+    if existing is not None and existing.tenant_id is not None:
+        # Core's push only ever mirrors GLOBAL (legacy) accounts. A
+        # tenant-scoped account (2026-11-28) is owned by its tenant's
+        # namespace in this service and is never rewritten by Core.
+        raise UserSyncConflictError("user_id belongs to a tenant-scoped account; Core sync may not modify it")
+
     if existing is None:
         if identifier is None:
             return
         db.add(User(
             id=user_id, identifier=_normalize_identifier(identifier),
-            username=username, hashed_password=hashed_password,
+            username=username, username_normalized=normalize_username(username),
+            hashed_password=hashed_password,
             is_active=is_active if is_active is not None else True,
         ))
         await db.commit()
@@ -76,7 +83,7 @@ async def sync_user_from_core(
         normalized = _normalize_identifier(identifier)
         if normalized != existing.identifier:
             conflict = (
-                await db.execute(select(User).where(User.identifier == normalized))
+                await db.execute(select(User).where(User.identifier == normalized, User.tenant_id.is_(None)))
             ).scalar_one_or_none()
             if conflict is not None and conflict.id != user_id:
                 raise UserSyncConflictError(
@@ -84,6 +91,7 @@ async def sync_user_from_core(
                 )
             existing.identifier = normalized
         existing.username = username
+        existing.username_normalized = normalize_username(username)
     # user.password_changed: Core sends only user_id + hashed_password, so a bare event (no identifier/username/
     # is_active) IS a password change; a changed hash on any event is one too. Like deactivation it runs on every
     # such event (a relay retry after a failed marker write repairs it).

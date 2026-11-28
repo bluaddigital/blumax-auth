@@ -10,6 +10,10 @@ class ChangePasswordRequest(BaseModel):
 
 class PasswordResetRequest(BaseModel):
     identifier: str
+    # Same meaning as LoginRequest.tenant (honoured only with
+    # TENANT_SCOPED_IDENTITY_MODE=on): resolves the account inside that
+    # tenant only.
+    tenant: str | None = None
 
 
 class PasswordResetConfirmRequest(BaseModel):
