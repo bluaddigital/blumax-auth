@@ -12,6 +12,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.tenant_membership import TenantMembership
+from app.models.user import User
+
+
+class MembershipTenantMismatchError(Exception):
+    """A membership for a tenant-scoped account (2026-11-28) naming a
+    DIFFERENT tenant than the account's own -- refused, never stored: an
+    account belongs to exactly one tenant and cross-tenant switching does
+    not exist."""
 
 
 async def sync_membership_from_core(
@@ -29,6 +37,9 @@ async def sync_membership_from_core(
     assignment (staff creation), both land here as a plain replace, same
     "one event covers both" reasoning TENANT_MEMBER_ROLE_ASSIGNED's own
     docstring in blumax-backend gives."""
+    user = await db.get(User, user_id)
+    if user is not None and user.tenant_id is not None and user.tenant_id != tenant_id:
+        raise MembershipTenantMismatchError("membership tenant differs from the account's own tenant")
     existing = (
         await db.execute(
             select(TenantMembership).where(

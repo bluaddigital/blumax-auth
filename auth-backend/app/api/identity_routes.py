@@ -35,12 +35,17 @@ async def create_identity_route(
     try:
         user, temp_password = await identity_service.create_identity(
             db, identifier=body.identifier, password=body.password, username=body.username,
+            tenant_id=body.tenant_id, tenant_slug=body.tenant_slug,
         )
-    except identity_service.DuplicateIdentifierError as exc:
+    except (identity_service.DuplicateIdentifierError, identity_service.TenantSlugConflictError) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except identity_service.IdentityError as exc:
+        # TenantScopedIdentityDisabledError, tenant_slug without tenant_id, blank names.
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     return CreateIdentityResponse(
         id=str(user.id), identifier=user.identifier, username=user.username,
         is_active=user.is_active, temporary_password=temp_password,
+        tenant_id=str(user.tenant_id) if user.tenant_id is not None else None,
     )
 
 
@@ -57,6 +62,7 @@ async def get_identity_route(
     return IdentityResponse(
         id=str(user.id), identifier=user.identifier, username=user.username,
         is_active=user.is_active, created_at=user.created_at,
+        tenant_id=str(user.tenant_id) if user.tenant_id is not None else None,
     )
 
 

@@ -7,11 +7,13 @@ the timing-safe password check (see security.py).
 """
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import UTC, datetime, timedelta
 
 import structlog
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,7 +28,8 @@ from app.core.security import (
 from app.core.session_revocation import is_session_revoked, revoke_user_sessions
 from app.models.refresh_token import RefreshToken
 from app.models.tenant_membership import TenantMembership
-from app.models.user import User
+from app.models.tenant_namespace import TenantNamespace, normalize_slug
+from app.models.user import User, normalize_identifier
 
 logger = structlog.get_logger(__name__)
 
@@ -39,6 +42,10 @@ _REUSE_GRACE_WINDOW = timedelta(seconds=10)
 
 class AuthenticationError(Exception):
     pass
+
+
+class AccountLoginThrottledError(AuthenticationError):
+    """Too many failed logins for one identifier in one tenant."""
 
 
 class TenantSelectionRequiredError(Exception):
@@ -87,20 +94,129 @@ async def _resolve_membership_claims(
     }
 
 
-async def login(
-    db: AsyncSession, *, identifier: str, password: str,
-    tenant_id: uuid.UUID | None = None,
-    user_agent: str | None = None, ip_address: str | None = None,
-) -> tuple[str, str]:
+async def resolve_tenant_ref(db: AsyncSession, tenant: str) -> uuid.UUID | None:
+    """A login's tenant reference -- the platform tenant UUID, or the
+    hospital code / tenant slug registered in tenant_namespaces. None when
+    the slug is unknown (callers answer exactly as for a wrong password,
+    so an unknown hospital code is not distinguishable)."""
+    raw = tenant.strip()
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        pass
+    return (
+        await db.execute(
+            select(TenantNamespace.tenant_id).where(TenantNamespace.slug == normalize_slug(raw))
+        )
+    ).scalar_one_or_none()
+
+
+async def _tenant_slug(db: AsyncSession, tenant_id: uuid.UUID) -> str | None:
+    return (
+        await db.execute(select(TenantNamespace.slug).where(TenantNamespace.tenant_id == tenant_id))
+    ).scalar_one_or_none()
+
+
+async def _tenant_scoped_claims(
+    db: AsyncSession, *, user: User, requested_tenant_id: uuid.UUID | None,
+) -> dict:
+    """Claims for a tenant-scoped account: the token carries exactly ONE
+    tenant -- the account's own -- and `sub` is that tenant's account id.
+    A request naming any other tenant is refused (no cross-tenant
+    switching, owner decision 2026-11-28). Role/facility claims come only
+    from an active membership row for that same tenant; membership rows for
+    any other tenant are never consulted. Without one, the token is bound
+    to the tenant with the most restrictive claims (VIEWER, no facility)."""
+    if requested_tenant_id is not None and requested_tenant_id != user.tenant_id:
+        raise AuthenticationError("No active membership for the requested tenant")
+    membership = (
+        await db.execute(
+            select(TenantMembership).where(
+                TenantMembership.user_id == user.id,
+                TenantMembership.tenant_id == user.tenant_id,
+                TenantMembership.is_active.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    slug = await _tenant_slug(db, user.tenant_id)
+    if membership is None:
+        return {
+            "tenant_id": user.tenant_id, "tenant_slug": slug,
+            "role": None, "archetype": "VIEWER", "facility_ids": [],
+        }
+    return {
+        "tenant_id": user.tenant_id, "tenant_slug": slug or membership.tenant_slug,
+        "role": membership.role_name, "archetype": membership.role_archetype,
+        "facility_ids": membership.facility_ids,
+    }
+
+
+async def _claims_for_user(
+    db: AsyncSession, *, user: User, requested_tenant_id: uuid.UUID | None,
+) -> dict | None:
+    if user.tenant_id is not None:
+        return await _tenant_scoped_claims(db, user=user, requested_tenant_id=requested_tenant_id)
+    return await _resolve_membership_claims(db, user_id=user.id, requested_tenant_id=requested_tenant_id)
+
+
+def _legacy_user_stmt(identifier: str):
     # `identifier` (email) matches exactly, unchanged -- `username` matches
     # case-insensitively, mirroring Core's own get_by_identifier so an
     # account migrated from Core keeps logging in the same way it always
-    # did there, by either email or username.
-    result = await db.execute(
-        select(User).where(
-            or_(User.identifier == identifier, func.lower(User.username) == identifier.strip().lower())
-        )
+    # did there, by either email or username. Global (tenant_id IS NULL)
+    # rows only: a tenant-scoped account is never reachable without naming
+    # its tenant (and the same username may exist in several tenants).
+    return select(User).where(
+        User.tenant_id.is_(None),
+        or_(User.identifier == identifier, func.lower(User.username) == identifier.strip().lower()),
     )
+
+
+async def find_tenant_user(db: AsyncSession, *, tenant_id: uuid.UUID, identifier: str) -> User | None:
+    """The tenant-scoped account in `tenant_id` whose identifier or
+    username matches (both normalized). Never looks outside that tenant."""
+    norm = normalize_identifier(identifier)
+    rows = (
+        await db.execute(
+            select(User).where(
+                User.tenant_id == tenant_id,
+                or_(User.identifier == norm, User.username_normalized == norm),
+            )
+        )
+    ).scalars().all()
+    # Creation refuses an identifier/username that collides with either
+    # column of another account in the same tenant; prefer the identifier
+    # match anyway in case older rows overlap.
+    for row in rows:
+        if row.identifier == norm:
+            return row
+    return rows[0] if rows else None
+
+
+async def login(
+    db: AsyncSession, *, identifier: str, password: str,
+    tenant_id: uuid.UUID | None = None, tenant: str | None = None,
+    user_agent: str | None = None, ip_address: str | None = None,
+    redis: Redis | None = None,
+) -> tuple[str, str]:
+    """`tenant` (hospital code / tenant slug, or tenant UUID) is honoured
+    only with TENANT_SCOPED_IDENTITY_MODE=on; with the mode off this
+    function behaves exactly as before the setting existed.
+
+    With a tenant: the account is resolved inside that tenant only. A
+    tenant-scoped account wins; if none matches, a GLOBAL legacy account
+    may still sign in, bound to that tenant through its active membership
+    (so a hospital login page that starts sending its code does not lock
+    out not-yet-migrated staff). Without a tenant: global accounts only --
+    a tenant-scoped account cannot be reached."""
+    if tenant is not None and tenant.strip() and settings.tenant_scoped_identity_enabled:
+        return await _login_in_tenant(
+            db, identifier=identifier, password=password, tenant=tenant,
+            requested_tenant_id=tenant_id, user_agent=user_agent, ip_address=ip_address,
+            redis=redis,
+        )
+
+    result = await db.execute(_legacy_user_stmt(identifier))
     user = result.scalar_one_or_none()
 
     # Constant-work password check regardless of whether `user` exists --
@@ -133,6 +249,108 @@ async def login(
     await db.commit()
 
     logger.info("login.success", user_id=str(user.id), tenant_id=str(tenant_id) if tenant_id else None)
+    return access_token, refresh_token
+
+
+async def _issue_pair(
+    db: AsyncSession, *, user: User, claims: dict | None,
+    user_agent: str | None, ip_address: str | None,
+    bound_tenant_id: uuid.UUID | None = None,
+) -> tuple[str, str]:
+    access_token, _ = create_access_token(user_id=user.id, **(claims or {}))
+    refresh_row = RefreshToken(
+        user_id=user.id,
+        expires_at=datetime.now(UTC) + _refresh_lifetime(),
+        user_agent=user_agent, ip_address=ip_address,
+    )
+    db.add(refresh_row)
+    await db.flush()
+    refresh_token = create_refresh_token(
+        user_id=user.id, token_id=refresh_row.id, bound_tenant_id=bound_tenant_id,
+    )
+    await db.commit()
+    return access_token, refresh_token
+
+
+def _account_failure_key(tenant_id: uuid.UUID | None, identifier: str) -> str:
+    digest = hashlib.sha256(normalize_identifier(identifier).encode()).hexdigest()[:32]
+    return f"rate_limit:login-account:{tenant_id or 'unknown'}:{digest}"
+
+
+async def _account_failures(redis: Redis | None, key: str) -> int:
+    if redis is None:
+        return 0
+    try:
+        return int(await redis.get(key) or 0)
+    except RedisError:  # Redis trouble never blocks a login; the IP limit still applies
+        logger.warning("login.account_limit_unavailable")
+        return 0
+
+
+async def _record_account_failure(redis: Redis | None, key: str) -> None:
+    if redis is None:
+        return
+    try:
+        count = await redis.incr(key)
+        if count == 1:
+            await redis.expire(key, settings.LOGIN_ACCOUNT_FAILURE_WINDOW_SECONDS)
+    except RedisError:
+        logger.warning("login.account_limit_unavailable")
+
+
+async def _login_in_tenant(
+    db: AsyncSession, *, identifier: str, password: str, tenant: str,
+    requested_tenant_id: uuid.UUID | None,
+    user_agent: str | None, ip_address: str | None,
+    redis: Redis | None = None,
+) -> tuple[str, str]:
+    resolved = await resolve_tenant_ref(db, tenant)
+    # Unknown hospital codes share one counter per identifier, so the
+    # answer for a wrong code and a wrong password stays the same.
+    failure_key = _account_failure_key(resolved, identifier)
+    if await _account_failures(redis, failure_key) >= settings.LOGIN_ACCOUNT_FAILURE_LIMIT:
+        logger.info("login.failed", identifier=identifier, reason="account_throttled", tenant_scoped=True)
+        raise AccountLoginThrottledError("Too many failed login attempts; try again later")
+    user: User | None = None
+    if resolved is not None and (requested_tenant_id is None or requested_tenant_id == resolved):
+        user = await find_tenant_user(db, tenant_id=resolved, identifier=identifier)
+        if user is None:
+            user = (await db.execute(_legacy_user_stmt(identifier))).scalar_one_or_none()
+
+    # Same constant-work password check as the legacy path, whether or not
+    # the tenant or the account exists.
+    password_ok = verify_password_constant_time(
+        password, user.hashed_password if user is not None else None
+    )
+    if user is None or not password_ok:
+        await _record_account_failure(redis, failure_key)
+        logger.info("login.failed", identifier=identifier, reason="invalid_credentials", tenant_scoped=True)
+        raise AuthenticationError("Invalid credentials")
+    if not user.is_active:
+        logger.info("login.failed", identifier=identifier, reason="inactive", tenant_scoped=True)
+        raise AuthenticationError("Account is deactivated")
+
+    # A tenant-scoped account is bound to its own tenant; a global legacy
+    # account must hold an active membership in the named tenant
+    # (_resolve_membership_claims raises otherwise) -- either way the token
+    # carries exactly the tenant the login named.
+    claims = await _claims_for_user(db, user=user, requested_tenant_id=resolved)
+    # The session is bound to the tenant the login named: its refresh
+    # token carries it, so a later refresh cannot re-bind a global legacy
+    # account to another of its tenants (no cross-tenant switching).
+    access_token, refresh_token = await _issue_pair(
+        db, user=user, claims=claims, user_agent=user_agent, ip_address=ip_address,
+        bound_tenant_id=resolved,
+    )
+    if redis is not None:
+        try:
+            await redis.delete(failure_key)
+        except RedisError:
+            logger.warning("login.account_limit_unavailable")
+    logger.info(
+        "login.success", user_id=str(user.id), tenant_id=str(resolved),
+        account_kind="tenant" if user.tenant_id is not None else "global",
+    )
     return access_token, refresh_token
 
 
@@ -170,9 +388,7 @@ async def mint_for_verified_identity(
     if not user.is_active:
         raise AuthenticationError("Account is deactivated")
 
-    membership_claims = await _resolve_membership_claims(
-        db, user_id=user.id, requested_tenant_id=tenant_id,
-    )
+    membership_claims = await _claims_for_user(db, user=user, requested_tenant_id=tenant_id)
     access_token, _ = create_access_token(user_id=user.id, **(membership_claims or {}))
 
     refresh_row = RefreshToken(
@@ -218,6 +434,12 @@ async def refresh(
         raise AuthenticationError("Invalid refresh token") from exc
 
     token_id = uuid.UUID(claims["jti"])
+    bound_tenant_id = uuid.UUID(claims["btid"]) if claims.get("btid") else None
+    if bound_tenant_id is not None and tenant_id is not None and tenant_id != bound_tenant_id:
+        # Checked before the row is touched: a refresh naming another tenant
+        # is refused without rotating or revoking anything.
+        logger.info("refresh.failed", reason="tenant_mismatch", jti=str(token_id))
+        raise AuthenticationError("No active membership for the requested tenant")
     result = await db.execute(select(RefreshToken).where(RefreshToken.id == token_id))
     row = result.scalar_one_or_none()
     if row is None:
@@ -304,11 +526,15 @@ async def refresh(
     db.add(new_row)
     await db.flush()
 
-    membership_claims = await _resolve_membership_claims(
-        db, user_id=row.user_id, requested_tenant_id=tenant_id,
+    # A tenant-scoped account's refresh stays bound to its own tenant: a
+    # refresh naming another tenant is refused, never re-bound.
+    membership_claims = await _claims_for_user(
+        db, user=user, requested_tenant_id=bound_tenant_id or tenant_id,
     )
     new_access_token, _ = create_access_token(user_id=row.user_id, **(membership_claims or {}))
-    new_refresh_token = create_refresh_token(user_id=row.user_id, token_id=new_row.id)
+    new_refresh_token = create_refresh_token(
+        user_id=row.user_id, token_id=new_row.id, bound_tenant_id=bound_tenant_id,
+    )
     await db.commit()
 
     logger.info("refresh.success", user_id=str(row.user_id))

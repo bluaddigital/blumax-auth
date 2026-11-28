@@ -194,18 +194,27 @@ def create_access_token(
     return token, jti
 
 
-def create_refresh_token(*, user_id: uuid.UUID, token_id: uuid.UUID) -> str:
+def create_refresh_token(
+    *, user_id: uuid.UUID, token_id: uuid.UUID, bound_tenant_id: uuid.UUID | None = None,
+) -> str:
     """jti = the DB RefreshToken row's own id (same pattern Core uses) --
     the row is the revocation/expiry index, the JWT carries no secret of
-    its own beyond the signature."""
+    its own beyond the signature.
+
+    `bound_tenant_id` (2026-11-28): set when the login named a hospital, so
+    every refresh of this session stays in that tenant (claim `btid`).
+    Absent otherwise, so older refresh tokens are byte-identical."""
     now = datetime.now(UTC)
     claims = TokenClaims(
         sub=str(user_id), token_type="refresh", jti=str(token_id), iat=now,
         exp=now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
     )
+    payload = claims.to_dict()
+    if bound_tenant_id is not None:
+        payload["btid"] = str(bound_tenant_id)
     keys = signing_keys()
     return jwt.encode(
-        claims.to_dict(), keys.private_pem(), algorithm=ALGORITHM,
+        payload, keys.private_pem(), algorithm=ALGORITHM,
         headers={"kid": keys.kid},
     )
 

@@ -69,6 +69,12 @@ class Settings(BaseSettings):
     # --- Rate limiting (login) ----------------------------------------------
     LOGIN_RATE_LIMIT_MAX_ATTEMPTS: int = 10
     LOGIN_RATE_LIMIT_WINDOW_SECONDS: int = 60
+    # Per-account failed-login limit for a login that names a hospital
+    # (tenant-scoped mode only). Keyed by tenant + normalized identifier, so
+    # it applies whether or not the account exists (no enumeration); only
+    # failures count, and a successful login clears the counter.
+    LOGIN_ACCOUNT_FAILURE_LIMIT: int = 10
+    LOGIN_ACCOUNT_FAILURE_WINDOW_SECONDS: int = 900
 
     # --- Session revocation fail-mode ---------------------------------------
     # The prior Core audit found session-revocation checks silently fail
@@ -165,6 +171,30 @@ class Settings(BaseSettings):
     # one, while a public caller now gets only the generic 202 response,
     # same as production.
     DEV_TOOLING_RESET_CODE_REVEAL_KEY: str = "dev-tooling-reset-code-reveal-key-change-me"
+
+    # --- Tenant-scoped staff identity (2026-11-28) ---------------------------
+    # Owner decision 2026-11-28: "One tenant = one customer hospital
+    # organization = its own staff identity namespace." Ravi at Apollo and
+    # Ravi at Yashoda are two separate accounts (different ids, credentials,
+    # roles), never linked automatically. "off" (default) keeps every
+    # existing flow byte-for-byte: no tenant-scoped account can be created,
+    # and the `tenant` field on login / password-reset is ignored. "on"
+    # enables tenant-scoped creation (POST /admin/identities with tenant_id)
+    # and tenant-aware login/reset. Global legacy rows (users.tenant_id IS
+    # NULL) keep working in both modes. See app/models/user.py.
+    TENANT_SCOPED_IDENTITY_MODE: str = "off"  # "off" | "on"
+
+    @field_validator("TENANT_SCOPED_IDENTITY_MODE", mode="before")
+    @classmethod
+    def _parse_tenant_mode(cls, v: object) -> object:
+        value = str(v).strip().lower() if v is not None else "off"
+        if value not in ("off", "on"):
+            raise ValueError("TENANT_SCOPED_IDENTITY_MODE must be 'off' or 'on'")
+        return value
+
+    @property
+    def tenant_scoped_identity_enabled(self) -> bool:
+        return self.TENANT_SCOPED_IDENTITY_MODE == "on"
 
     @property
     def is_production(self) -> bool:

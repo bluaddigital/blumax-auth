@@ -20,7 +20,11 @@ from app.services.auth_service import (
     TenantSelectionRequiredError,
     mint_for_verified_identity,
 )
-from app.services.membership_sync_service import revoke_membership_from_core, sync_membership_from_core
+from app.services.membership_sync_service import (
+    MembershipTenantMismatchError,
+    revoke_membership_from_core,
+    sync_membership_from_core,
+)
 from app.services.user_sync_service import UserSyncConflictError, sync_user_from_core
 
 internal_router = APIRouter(prefix="/internal", tags=["internal"])
@@ -79,11 +83,14 @@ async def sync_user_route(
 async def sync_membership_route(
     body: MembershipSyncRequest, db: AsyncSession = Depends(get_db),
 ) -> None:
-    await sync_membership_from_core(
-        db, user_id=body.user_id, tenant_id=body.tenant_id, tenant_slug=body.tenant_slug,
-        role_name=body.role_name, role_archetype=body.role_archetype,
-        facility_ids=body.facility_ids,
-    )
+    try:
+        await sync_membership_from_core(
+            db, user_id=body.user_id, tenant_id=body.tenant_id, tenant_slug=body.tenant_slug,
+            role_name=body.role_name, role_archetype=body.role_archetype,
+            facility_ids=body.facility_ids,
+        )
+    except MembershipTenantMismatchError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
 
 @internal_router.post(

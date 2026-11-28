@@ -12,6 +12,12 @@ class LoginRequest(BaseModel):
     # membership (see auth_service.TenantSelectionRequiredError) -- same
     # shape as Core's own LoginCommand.tenant_id.
     tenant_id: uuid.UUID | None = None
+    # Tenant-scoped staff identity (2026-11-28, honoured only with
+    # TENANT_SCOPED_IDENTITY_MODE=on): the hospital code / tenant slug, or
+    # the tenant UUID, naming the staff identity namespace to resolve the
+    # account in. Required for a tenant-scoped account -- without it only
+    # global legacy accounts can sign in.
+    tenant: str | None = None
 
 
 class TokenResponse(BaseModel):
