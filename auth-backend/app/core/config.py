@@ -69,6 +69,12 @@ class Settings(BaseSettings):
     # --- Rate limiting (login) ----------------------------------------------
     LOGIN_RATE_LIMIT_MAX_ATTEMPTS: int = 10
     LOGIN_RATE_LIMIT_WINDOW_SECONDS: int = 60
+    # Per-account failed-login limit for a login that names a hospital
+    # (tenant-scoped mode only). Keyed by tenant + normalized identifier, so
+    # it applies whether or not the account exists (no enumeration); only
+    # failures count, and a successful login clears the counter.
+    LOGIN_ACCOUNT_FAILURE_LIMIT: int = 10
+    LOGIN_ACCOUNT_FAILURE_WINDOW_SECONDS: int = 900
 
     # --- Session revocation fail-mode ---------------------------------------
     # The prior Core audit found session-revocation checks silently fail

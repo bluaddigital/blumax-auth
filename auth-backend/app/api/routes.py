@@ -34,8 +34,10 @@ async def login_route(
         access_token, refresh_token = await auth_service.login(
             db, identifier=body.identifier, password=body.password, tenant_id=body.tenant_id,
             tenant=body.tenant,
-            user_agent=request.headers.get("user-agent"), ip_address=client_ip,
+            user_agent=request.headers.get("user-agent"), ip_address=client_ip, redis=redis,
         )
+    except auth_service.AccountLoginThrottledError as exc:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many login attempts") from exc
     except auth_service.TenantSelectionRequiredError as exc:
         # 409, not 400: the request is well-formed, it's the account state
         # that makes it ambiguous -- same posture as Core's own identical

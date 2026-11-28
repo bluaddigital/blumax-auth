@@ -275,7 +275,7 @@ async def test_I_email_normalization_is_trim_and_lowercase_only(db_session):
     assert stored.identifier == "casevariant@example.test"
 
 
-async def test_J_mixed_quality_batch_of_70_rows_classifies_every_category_correctly(db_session):
+async def test_J_mixed_quality_batch_of_70_rows_classifies_every_category_correctly(db_session, tmp_path):
     """70 total source rows: 50 clean-valid, 5 forming duplicate pairs/
     groups within the batch, 5 malformed UUIDs (rejected at parse time,
     not even reaching classify), 5 conflicting with identities already
@@ -312,7 +312,7 @@ async def test_J_mixed_quality_batch_of_70_rows_classifies_every_category_correc
     for row in already_rows:
         raw_rows.append({"id": str(row.id), "identifier": row.raw_identifier, "hashed_password": "h", "is_active": True})
 
-    path = "/tmp/claude-0/-home-BluMax-Health/fd7ed126-2ce0-4560-9cef-2f1f96bf9b4d/scratchpad/phase4f_mixed_70.json"
+    path = str(tmp_path / "phase4f_mixed_70.json")
     with open(path, "w") as f:
         json.dump(raw_rows, f)
 
