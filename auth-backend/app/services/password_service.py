@@ -29,7 +29,11 @@ from app.core.password_reset import consume_reset_code, mint_reset_code
 from app.core.security import hash_password, verify_password_constant_time
 from app.core.session_revocation import revoke_user_sessions
 from app.models.user import User
-from app.services.auth_service import revoke_all_refresh_tokens_stmt
+from app.services.auth_service import (
+    find_tenant_user,
+    resolve_tenant_ref,
+    revoke_all_refresh_tokens_stmt,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -59,7 +63,9 @@ async def change_password(
     logger.info("password.change.success", user_id=user_id)
 
 
-async def request_password_reset(db: AsyncSession, redis: Redis, *, identifier: str) -> str | None:
+async def request_password_reset(
+    db: AsyncSession, redis: Redis, *, identifier: str, tenant: str | None = None,
+) -> str | None:
     """Always safe to call regardless of whether `identifier` exists --
     the route layer returns the same response either way (see routes),
     closing the account-enumeration gap a differing response would open.
@@ -69,8 +75,24 @@ async def request_password_reset(db: AsyncSession, redis: Redis, *, identifier: 
     client -- see docs/PHASE5_BLUMAX_AUTH_CAPABILITY_COMPLETION.md's
     password-management section for why the transport step is explicitly
     out of scope for this phase."""
-    result = await db.execute(select(User).where(User.identifier == identifier))
-    user = result.scalar_one_or_none()
+    user: User | None
+    if tenant is not None and tenant.strip() and settings.tenant_scoped_identity_enabled:
+        # Tenant-bound (2026-11-28): resolved inside the named tenant only --
+        # a reset for Apollo's ravi can never select Yashoda's ravi. Falls
+        # back to a GLOBAL legacy account with that exact identifier, the
+        # same fallback login applies; a tenant-scoped account is never
+        # reachable through another tenant or through no tenant.
+        resolved = await resolve_tenant_ref(db, tenant)
+        user = None
+        if resolved is not None:
+            user = await find_tenant_user(db, tenant_id=resolved, identifier=identifier)
+            if user is None:
+                user = (
+                    await db.execute(select(User).where(User.identifier == identifier, User.tenant_id.is_(None)))
+                ).scalar_one_or_none()
+    else:
+        result = await db.execute(select(User).where(User.identifier == identifier, User.tenant_id.is_(None)))
+        user = result.scalar_one_or_none()
     if user is None or not user.is_active:
         logger.info("password.reset_request.noop", identifier=identifier)
         return None

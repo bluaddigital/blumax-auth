@@ -33,6 +33,7 @@ async def login_route(
     try:
         access_token, refresh_token = await auth_service.login(
             db, identifier=body.identifier, password=body.password, tenant_id=body.tenant_id,
+            tenant=body.tenant,
             user_agent=request.headers.get("user-agent"), ip_address=client_ip,
         )
     except auth_service.TenantSelectionRequiredError as exc:

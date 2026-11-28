@@ -1,6 +1,7 @@
 from app.models.refresh_token import RefreshToken
 from app.models.service_account import ServiceAccount
 from app.models.tenant_membership import TenantMembership
+from app.models.tenant_namespace import TenantNamespace
 from app.models.user import User
 
-__all__ = ["RefreshToken", "ServiceAccount", "TenantMembership", "User"]
+__all__ = ["RefreshToken", "ServiceAccount", "TenantMembership", "TenantNamespace", "User"]
