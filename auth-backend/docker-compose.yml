@@ -7,13 +7,13 @@
 #   docker compose up -d --build
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-blumax_auth}
       POSTGRES_USER: ${POSTGRES_USER:-authuser}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-authpass}
     volumes:
-      - auth_pgdata:/var/lib/postgresql/data
+      - auth_pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-authuser} -d ${POSTGRES_DB:-blumax_auth}"]
       interval: 5s
