@@ -263,3 +263,72 @@ async def test_admin_deactivate_is_per_account(client, two_ravis):
     assert r.status_code == 204
     assert (await _login(client, tenant="apollo", password=APOLLO_PW)).status_code == 401
     assert (await _login(client, tenant="yashoda", password=YASHODA_PW)).status_code == 200
+
+
+# --- follow-ups 2026-11-28: session bound to the login's tenant; per-account limit
+
+
+async def test_legacy_account_refresh_cannot_switch_to_its_other_tenant(client, test_user: User, mode_on, db_session):
+    """A global legacy account with memberships in two tenants signs in on
+    Apollo's page: its refresh token is bound to Apollo, so naming Yashoda
+    on refresh is refused and a plain refresh stays in Apollo."""
+    for tid, slug in ((APOLLO, "apollo"), (YASHODA, "yashoda")):
+        db_session.add(TenantMembership(
+            user_id=test_user.id, tenant_id=tid, tenant_slug=slug, role_name="Nurse",
+            role_archetype="CLINICIAN", facility_ids=[],
+        ))
+    await db_session.commit()
+    pw = "correct-horse-battery-staple"
+    refresh = (await _login(client, tenant=str(APOLLO), identifier="alice", password=pw)).json()["refresh_token"]
+    r = await client.post("/auth/refresh", json={"refresh_token": refresh, "tenant_id": str(YASHODA)})
+    assert r.status_code == 401
+    # the refused attempt did not rotate or revoke the session
+    r = await client.post("/auth/refresh", json={"refresh_token": refresh})
+    assert r.status_code == 200, r.text
+    assert (await _me(client, r.json()["access_token"])).json()["tid"] == str(APOLLO)
+    # and the rotated token carries the same binding
+    r2 = await client.post("/auth/refresh", json={"refresh_token": r.json()["refresh_token"], "tenant_id": str(YASHODA)})
+    assert r2.status_code == 401
+
+
+async def test_login_without_hospital_keeps_old_refresh_behaviour(client, test_user: User, mode_on, db_session):
+    db_session.add(TenantMembership(
+        user_id=test_user.id, tenant_id=APOLLO, tenant_slug="apollo", role_name="Nurse",
+        role_archetype="CLINICIAN", facility_ids=[],
+    ))
+    await db_session.commit()
+    r = await client.post("/auth/login", json={"identifier": "alice@example.test", "password": "correct-horse-battery-staple"})
+    assert r.status_code == 200
+    r = await client.post("/auth/refresh", json={"refresh_token": r.json()["refresh_token"], "tenant_id": str(APOLLO)})
+    assert r.status_code == 200
+
+
+async def test_failed_logins_are_limited_per_account_in_a_tenant(client, two_ravis, monkeypatch, _fresh_redis_per_test):
+    monkeypatch.setattr(settings, "LOGIN_ACCOUNT_FAILURE_LIMIT", 3)
+    monkeypatch.setattr(settings, "LOGIN_RATE_LIMIT_MAX_ATTEMPTS", 100)
+    for _ in range(3):
+        assert (await _login(client, tenant="apollo", password="wrong")).status_code == 401
+    # even the right password is refused while the limit holds
+    assert (await _login(client, tenant="apollo", password=APOLLO_PW)).status_code == 429
+    # the same username at another hospital is a different account, unaffected
+    assert (await _login(client, tenant="yashoda", password=YASHODA_PW)).status_code == 200
+
+
+async def test_unknown_hospital_code_is_limited_like_a_wrong_password(client, two_ravis, monkeypatch):
+    monkeypatch.setattr(settings, "LOGIN_ACCOUNT_FAILURE_LIMIT", 2)
+    monkeypatch.setattr(settings, "LOGIN_RATE_LIMIT_MAX_ATTEMPTS", 100)
+    for _ in range(2):
+        r = await _login(client, tenant="no-such-hospital", password=APOLLO_PW)
+        assert (r.status_code, r.json()["detail"]) == (401, "Invalid credentials")
+    assert (await _login(client, tenant="no-such-hospital", password=APOLLO_PW)).status_code == 429
+
+
+async def test_successful_login_clears_the_account_counter(client, two_ravis, monkeypatch):
+    monkeypatch.setattr(settings, "LOGIN_ACCOUNT_FAILURE_LIMIT", 3)
+    monkeypatch.setattr(settings, "LOGIN_RATE_LIMIT_MAX_ATTEMPTS", 100)
+    for _ in range(2):
+        await _login(client, tenant="apollo", password="wrong")
+    assert (await _login(client, tenant="apollo", password=APOLLO_PW)).status_code == 200
+    for _ in range(2):
+        assert (await _login(client, tenant="apollo", password="wrong")).status_code == 401
+    assert (await _login(client, tenant="apollo", password=APOLLO_PW)).status_code == 200
